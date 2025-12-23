@@ -6,39 +6,27 @@
 
 PbSync, Proxmox Backup Server (PBS) üzerinde duran yedeklerinizi, yerel diskinizde hiç yer kaplamadan, "stream" (akış) yöntemiyle sıkıştırıp `rclone` aracılığıyla dilediğiniz bulut hedefine gönderen, web arayüzlü, modern bir araçtır.
 
-"Agentless File-Level Restore" mantığıyla çalışır; yedeğin tamamını değil, içindeki dosyaları canlı olarak buluta aktarmanızı sağlar.
-
 ---
 
 ### 🌟 Temel Özellikler
 
--   **Web Arayüzü:** Tüm işlemleri tarayıcınız üzerinden, kolay ve şık bir arayüzle yönetin.
+-   **Tam Web Arayüzü:** PBS bağlantısı, Rclone ayarları ve yedekleme işlemleri dahil her şeyi tarayıcıdan yönetin.
 -   **Sıfır Yerel Disk Kullanımı:** Yedek dosyalarını önce sunucuya indirme derdi yok. Veri, RAM üzerinden işlenir ve doğrudan buluta akar.
 -   **Geniş Bulut Desteği:** `rclone` entegrasyonu sayesinde 100'den fazla bulut depolama servisini (S3, Google Drive, FTP, WebDAV vb.) destekler.
--   **Akıllı Tarama:** VM ID'sini girdiğinizde, mevcut tüm yedek (snapshot) listesini otomatik olarak PBS'ten çeker.
--   **Kolay Kurulum:** Tek satırlık `curl | bash` komutu ile sisteme hızlıca kurun.
--   **Esnek Yapılandırma:** Tüm ayarları basit bir `.conf` dosyası üzerinden yönetin.
--   **Arka Plan İşlemleri:** Yedekleme işlemleri arka planda çalışır, bu sırada siz arayüzden başka işlemler yapabilirsiniz (ileride eklenecek log ekranı ile).
+-   **Docker ile Kolay Kurulum:** Bağımlılıklarla uğraşmadan, izole ve güvenli bir ortamda çalışır.
+-   **Kalıcı Ayarlar:** Yapılandırmalarınız Docker volume sayesinde korunur.
 
-### ⚙️ Nasıl Çalışır?
+### 🚀 Kurulum
 
-PbSync, Linux'un güçlü araçlarını modern bir Python/FastAPI arayüzü arkasında birleştirir:
-1.  **Map:** `proxmox-backup-client` ile seçilen yedek, bir "loop device" olarak sisteme tanıtılır (diske yazılmaz).
-2.  **Mount:** Bu sanal disk, `salt okunur (read-only)` olarak geçici bir dizine bağlanır.
-3.  **Stream & Pipe:**
-    -   `tar` komutu, bağlanan dizindeki dosyaları okuyup standart çıktıya (stdout) bir arşiv akışı olarak gönderir.
-    -   `pigz` (paralel çalışan gzip), bu akışı anında yakalar ve sıkıştırır.
-    -   `rclone rcat`, sıkıştırılmış veri akışını alır ve doğrudan bulut hedefine yükler.
-
-Tüm bu süreç, bir boru hattı (`|` pipe) gibi çalışır ve verinin diskle teması olmaz.
-
-###  kurulum
-
-Aşağıdaki komutu **root yetkileriyle** (`sudo`) çalıştırarak PbSync'i sisteminize kurabilirsiniz. Script, gerekli dizinleri oluşturacak, Python bağımlılıklarını kuracak ve `pbsync` komutunu sistem genelinde kullanılabilir hale getirecektir.
+Projeyi GitHub'dan sunucunuza çekin ve Docker Compose ile başlatın.
 
 ```bash
-# DEĞİŞTİR: URL'yi kendi GitHub reponuzla güncelleyin
-curl -sL https://raw.githubusercontent.com/KULLANICI_ADINIZ/PbSync/main/install.sh | sudo bash
+# Projeyi klonlayın
+git clone https://github.com/emregktp/PbSync.git
+cd PbSync
+
+# Servisi başlatın
+docker-compose up -d --build
 ```
 
 Kurulum tamamlandığında, `pbsync.conf` dosyanızı yapılandırmanız istenecektir.
