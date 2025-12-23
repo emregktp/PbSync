@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PbSync</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+    <style>
+        body { background-color: #1a1a1a; color: #f0f0f0; }
+        .card { background-color: #2a2a2a; border: 1px solid #444; }
+        .form-control, .form-select {
+            background-color: #333;
+            color: #f0f0f0;
+            border-color: #555;
+        }
+        .form-control:focus, .form-select:focus {
+            background-color: #444;
+            color: #f0f0f0;
+            border-color: #0d6efd;
+            box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, .25);
+        }
+        .form-control::placeholder { color: #888; }
+        #statusArea .alert { white-space: pre-wrap; word-wrap: break-word; }
+        .config-info { font-size: 0.9em; color: #aaa; }
+    </style>
+</head>
+<body class="text-white">
+    <div class="container mt-5">
+        <div class="d-flex justify-content-between align-items-center">
+            <h1 class="text-primary fw-bold"><i class="bi bi-hdd-stack"></i> PbSync</h1>
+            <div class="config-info">
+                Bağlı: <strong>{{ config.pbs_repository_path }}</strong>
+                <a href="/setup" class="btn btn-sm btn-outline-secondary ms-2"><i class="bi bi-gear"></i></a>
+            </div>
+        </div>
+        <p class="lead">Proxmox Agentless Cloud Streamer</p>
+        
+        <div class="card mt-4">
+            <div class="card-body">
+                <form id="backupForm" onsubmit="return false;">
+                    <div class="mb-3">
+                        <label for="vmid" class="form-label"><strong>1. Sanal Makine ID'si</strong></label>
+                        <div class="input-group">
+                            <input type="text" id="vmid" class="form-control" placeholder="Örn: 101">
+                            <button type="button" id="getSnapshotsBtn" onclick="getSnapshots()" class="btn btn-info">
+                                <span id="scanSpinner" class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span>
+                                Yedekleri Tara
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="snapshotSelect" class="form-label"><strong>2. Yedek (Snapshot) Seç</strong></label>
+                        <select id="snapshotSelect" name="snapshot" class="form-select" disabled>
+                            <option>Önce VM ID girip taratın...</option>
+                        </select>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="remoteSelect" class="form-label"><strong>3. Hedef Bulut (Rclone)</strong></label>
+                        <select id="remoteSelect" name="remote" class="form-select">
+                            {% if remotes and not "HATA" in remotes[0] %}
+                                {% for remote in remotes %}
+                                <option value="{{ remote }}">{{ remote }}</option>
+                                {% endfor %}
+                            {% else %}
+                                <option value="" disabled selected>{{ remotes[0] or "Hiç rclone hedefi bulunamadı." }}</option>
+                            {% endif %}
+                        </select>
+                    </div>
+
+                    <button type="button" id="startBackupBtn" onclick="startBackup()" class="btn btn-success w-100 p-3">
+                        <i class="bi bi-arrow-right-circle"></i> AKTARIMI BAŞLAT
+                    </button>
+                </form>
+            </div>
+        </div>
+        <div id="statusArea" class="mt-4"></div>
+    </div>
+
+    <script>
+        const vmidInput = document.getElementById("vmid");
+        const getSnapshotsBtn = document.getElementById("getSnapshotsBtn");
+        const scanSpinner = document.getElementById("scanSpinner");
+        const snapshotSelect = document.getElementById("snapshotSelect");
+        const startBackupBtn = document.getElementById("startBackupBtn");
+        const statusArea = document.getElementById("statusArea");
+
+        async function getSnapshots() {
+            let vmid = vmidInput.value;
+            if (!vmid) {
+                showAlert("Lütfen bir VM ID girin.", "warning");
+                return;
+            }
+            toggleScanner(true);
+            let formData = new FormData();
+            formData.append("vmid", vmid);
+            
+            try {
+                const response = await fetch("/scan-snapshots", {method: "POST", body: formData});
+                const data = await response.json();
+                
+                snapshotSelect.innerHTML = "";
+                if (data.status === "success" && data.snapshots.length > 0) {
+                    data.snapshots.forEach(snap => {
+                        let opt = new Option(snap, snap);
+                        snapshotSelect.appendChild(opt);
+                    });
+                    snapshotSelect.disabled = false;
+                    showAlert(`<strong>${vmid}</strong> için ${data.snapshots.length} yedek bulundu.`, "info");
+                } else {
+                    snapshotSelect.disabled = true;
+                    snapshotSelect.innerHTML = '<option selected disabled>Yedek bulunamadı.</option>';
+                    showAlert(data.message, "danger");
+                }
+            } catch (error) {
+                showAlert(`Sunucuyla iletişim kurulamadı: ${error}`, "danger");
+            } finally {
+                toggleScanner(false);
+            }
+        }
+
+        async function startBackup() {
+            let formData = new FormData();
+            formData.append("snapshot", snapshotSelect.value);
+            formData.append("remote", document.getElementById("remoteSelect").value);
+
+            if (!formData.get("snapshot") || snapshotSelect.disabled) {
+                showAlert("Lütfen geçerli bir yedek seçin.", "warning");
+                return;
+            }
+            toggleBackupBtn(true);
+            
+            try {
+                const response = await fetch("/start-stream", {method: "POST", body: formData});
+                const data = await response.json();
+                if (data.status === "started") {
+                    showAlert(data.message, "success");
+                } else {
+                    showAlert(data.message || "Bilinmeyen bir hata oluştu.", "danger");
+                    toggleBackupBtn(false);
+                }
+            } catch (error) {
+                showAlert(`Sunucuyla iletişim kurulamadı: ${error}`, "danger");
+                toggleBackupBtn(false);
+            }
+        }
+
+        function showAlert(message, type) {
+            statusArea.innerHTML = `<div class="alert alert-${type} alert-dismissible fade show" role="alert">${message}<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button></div>`;
+        }
+        
+        function toggleScanner(isLoading) {
+            getSnapshotsBtn.disabled = isLoading;
+            scanSpinner.classList.toggle("d-none", !isLoading);
+        }
+
+        function toggleBackupBtn(isLoading) {
+            startBackupBtn.disabled = isLoading;
+            startBackupBtn.innerHTML = isLoading ? '<span class="spinner-border spinner-border-sm"></span> İşlem Başlatıldı...' : '<i class="bi bi-arrow-right-circle"></i> AKTARIMI BAŞLAT';
+        }
+        
+        vmidInput.addEventListener("keypress", (event) => {
+            if (event.key === "Enter") {
+                event.preventDefault();
+                getSnapshotsBtn.click();
+            }
+        });
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

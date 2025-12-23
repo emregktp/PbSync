@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv
+venv/
+.env
+
+# OS
+.DS_Store
+
+# PbSync Data (Configs, secrets)
+data/*
+!data/.gitkeep

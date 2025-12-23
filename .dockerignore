@@ -1,0 +1,17 @@
+# Docker imajına kopyalanmayacak dosyalar ve klasörler
+
+.git
+.vscode
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.dockerignore
+Dockerfile
+docker-compose.yml
+README.md
+moxstream.example.conf
