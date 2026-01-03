@@ -38,83 +38,72 @@ def cleanup():
     run_command(["vgchange", "-an"], check=False)
     run_command(["kpartx", "-d", MAIN_LOOP_DEV], check=False)
     run_command(["dmsetup", "remove_all"], check=False)
+    # Loop cihazını zorla serbest bırak
+    run_command(["losetup", "-d", MAIN_LOOP_DEV], check=False) 
     run_command(["proxmox-backup-client", "unmap", MAIN_LOOP_DEV], check=False)
     print("--- Cleanup Finished ---")
 
-def debug_disk_structure():
-    """
-    Mount hatası alındığında disk yapısını loglara basar.
-    """
-    print("\n" + "!"*30 + " DEBUG INFO " + "!"*30)
-    print("-> Listing Block Devices (lsblk):")
-    run_command(["lsblk", "-a", "-o", "NAME,SIZE,TYPE,FSTYPE"], check=False)
-    print("\n-> Listing Mappers (/dev/mapper):")
-    run_command("ls -l /dev/mapper", shell=True, check=False)
-    print("!"*72 + "\n")
-
 def get_mount_candidates():
     """
-    Mount edilebilecek tüm adayları bulur.
+    SADECE loop0 ve ona bağlı mapper cihazlarını tarar.
+    Asla sda, sdb gibi fiziksel disklere bakmaz.
     """
-    print(f"-> Analyzing mount candidates...")
+    print(f"-> Analyzing partitions on {MAIN_LOOP_DEV}...")
+    
+    # 1. Eğer ana cihaz yoksa (Map başarısızsa) direkt çık.
+    if not os.path.exists(MAIN_LOOP_DEV):
+        raise Exception(f"Device {MAIN_LOOP_DEV} does not exist. Map failed!")
+
     candidates = []
 
-    # 1. lsblk ile JSON al
+    # 2. lsblk ile SADECE loop0'ı sorgula
     try:
-        res = run_command(["lsblk", "-J", "-b", "-o", "NAME,SIZE,TYPE,FSTYPE"], check=False)
+        # -b: bytes, -J: json, -o: fields
+        # loop0 cihazını vererek aramayı kısıtlıyoruz
+        cmd = ["lsblk", "-b", "-J", "-o", "NAME,SIZE,TYPE,FSTYPE,PKNAME", MAIN_LOOP_DEV]
+        res = run_command(cmd)
         data = json.loads(res.stdout)
         
-        def extract_devices(dev_list):
+        def extract_candidates(devices):
             found = []
-            for d in dev_list:
-                # Loop0 veya altındakiler
+            for dev in devices:
+                name = dev.get('name')
+                # Tam yolunu bul
                 full_path = ""
-                name = d.get('name')
-                
-                # Path belirle
                 if os.path.exists(f"/dev/mapper/{name}"):
                     full_path = f"/dev/mapper/{name}"
                 elif os.path.exists(f"/dev/{name}"):
                     full_path = f"/dev/{name}"
                 
                 if full_path:
-                    # Sadece partition, lvm veya loop ana cihazı al
-                    if d.get('type') in ['part', 'lvm', 'loop', 'rom']:
-                        found.append({
-                            'path': full_path,
-                            'size': int(d.get('size', 0)),
-                            'fstype': d.get('fstype')
-                        })
+                    found.append(full_path)
                 
-                if 'children' in d:
-                    found.extend(extract_devices(d['children']))
+                if 'children' in dev:
+                    found.extend(extract_candidates(dev['children']))
             return found
 
-        candidates = extract_devices(data.get('blockdevices', []))
+        candidates = extract_candidates(data.get('blockdevices', []))
 
     except Exception as e:
-        print(f"lsblk parsing failed: {e}. Falling back to glob.")
-        # Fallback: Glob
-        for path in glob.glob("/dev/mapper/*") + glob.glob("/dev/loop0*"):
-            if "control" not in path:
-                try:
-                    size = int(subprocess.check_output(["blockdev", "--getsize64", path]).strip())
-                    candidates.append({'path': path, 'size': size, 'fstype': None})
-                except: pass
-
-    # Boyuta göre sırala (En büyük en üstte)
-    candidates.sort(key=lambda x: x['size'], reverse=True)
+        print(f"lsblk parsing error: {e}")
     
-    # Sadece path listesi döndür
-    paths = [c['path'] for c in candidates]
-    
-    # Ana disk loop0'ı en sona at (Partition varsa önce onu denesin)
-    if MAIN_LOOP_DEV in paths and len(paths) > 1:
-        paths.remove(MAIN_LOOP_DEV)
-        paths.append(MAIN_LOOP_DEV)
+    # 3. Eğer lsblk bir şey bulamazsa manuel mapper kontrolü yap
+    if not candidates:
+        mappers = glob.glob("/dev/mapper/loop0*")
+        candidates.extend(mappers)
 
-    print(f"-> Candidates: {paths}")
-    return paths
+    # 4. Hiçbiri yoksa raw loop0'ı dene
+    if not candidates:
+        print("-> No partitions found inside loop0. Using raw device.")
+        candidates = [MAIN_LOOP_DEV]
+    
+    # 5. Ana Loop cihazını listenin sonuna at (Önce partitionları denesin)
+    if MAIN_LOOP_DEV in candidates and len(candidates) > 1:
+        candidates.remove(MAIN_LOOP_DEV)
+        candidates.append(MAIN_LOOP_DEV)
+
+    print(f"-> Safe Candidates: {candidates}")
+    return candidates
 
 def try_mount(device_path):
     print(f"-> Trying to mount: {device_path}")
@@ -148,7 +137,12 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
             "proxmox-backup-client", "map", snapshot, DRIVE_NAME,
             "--repository", config['pbs_repository_path']
         ]
-        run_command(map_cmd, env=current_env)
+        # Map hatasını yakala (OS Error 95 burada oluşuyor)
+        try:
+            run_command(map_cmd, env=current_env)
+        except subprocess.CalledProcessError:
+            return {"status": "error", "message": "Failed to map snapshot. Check PBS permissions or FUSE support on host."}
+
         time.sleep(2)
 
         # 2. Activate
@@ -158,7 +152,7 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
             run_command(["vgscan", "--mknodes"], check=False)
             run_command(["vgchange", "-ay"], check=False)
         except: pass
-        time.sleep(2)
+        time.sleep(1)
 
         # 3. Mount
         candidates = get_mount_candidates()
@@ -169,8 +163,7 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
                 break
         
         if not mounted:
-            debug_disk_structure() # Hata detayını loga bas
-            return {"status": "error", "message": "Could not mount any partition/volume. Check server logs."}
+            return {"status": "error", "message": "Could not mount partition. Disk might be encrypted or unsupported."}
 
         # 4. List Files
         safe_path = os.path.normpath(os.path.join(MOUNT_POINT, path.strip('/')))
@@ -225,7 +218,7 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
             run_command(["vgscan", "--mknodes"], check=False)
             run_command(["vgchange", "-ay"], check=False)
         except: pass
-        time.sleep(2)
+        time.sleep(1)
 
         # 3. Mount
         candidates = get_mount_candidates()
@@ -236,8 +229,7 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
                 break
         
         if not mounted:
-            debug_disk_structure()
-            raise Exception("Failed to mount any filesystem from the snapshot.")
+            raise Exception("Failed to mount filesystem from snapshot.")
 
         # 4. Stream
         vmid = snapshot.split('/')[1]
