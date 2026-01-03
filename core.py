@@ -1,12 +1,12 @@
 import os
 import subprocess
 import time
-import json
-import shutil
+import re
 
 # --- Constants ---
 DRIVE_NAME = "drive-scsi0.img"
-LOOP_DEV = "/dev/loop0"
+MAIN_LOOP_DEV = "/dev/loop0"
+PARTITION_LOOP_DEV = None # Dinamik olarak atanacak
 MOUNT_POINT = "/mnt/pbsync_restore"
 LOG_FILE_PATH = "/app/data/pbsync_stream.log"
 
@@ -28,127 +28,150 @@ def run_command(command, shell=False, check=True, env=None):
         print(f"STDERR: {e.stderr}")
         raise
 
-def get_largest_partition(device_path):
-    print(f"-> Searching for the largest partition in '{device_path}'...")
+def get_largest_partition_offset(device_path):
+    """
+    Diskin partition tablosunu okur ve en büyük bölümün
+    BAŞLANGIÇ OFFSET'ini (byte cinsinden) döner.
+    """
+    print(f"-> Analyzing partition table for '{device_path}'...")
     try:
-        # 1. Partition tablosunu okumaya zorla (kpartx)
-        run_command(["kpartx", "-a", "-v", device_path], check=False)
-        run_command(["partprobe", device_path], check=False)
-        time.sleep(2) # Cihazların oluşması için bekle
-
-        # 2. Partitionları listele
-        cmd = ["lsblk", "-nr", "-o", "NAME,SIZE,TYPE", "-b", device_path]
-        result = run_command(cmd)
+        # fdisk ile sektörleri listele
+        cmd = ["fdisk", "-l", "-o", "Start,Sectors,Type", device_path]
+        result = run_command(cmd, check=False)
+        
+        lines = result.stdout.strip().split('\n')
         partitions = []
         
-        base_name = os.path.basename(device_path) # loop0
+        sector_size = 512 # Varsayılan
         
-        for line in result.stdout.strip().split('\n'):
+        # Sektör boyutunu bul (Units: sectors of 1 * 512 = 512 bytes)
+        for line in lines:
+            if "Units:" in line and "bytes" in line:
+                match = re.search(r'=\s*(\d+)\s*bytes', line)
+                if match:
+                    sector_size = int(match.group(1))
+                    print(f"   Detected Sector Size: {sector_size}")
+
+        # Partition satırlarını oku
+        for line in lines:
+            # Sadece sayı ile başlayan satırları al (Start sütunu)
             parts = line.split()
-            if len(parts) < 2: continue
-            
-            name = parts[0]
-            size_str = parts[1]
-            p_type = parts[2] if len(parts) > 2 else "part"
-
-            # Sadece partition olanları al (disk'in kendisini atla)
-            # lsblk çıktısında partitionlar loop0p1 veya loop0-part1 gibi görünür
-            # Veya /dev/mapper altında oluşmuş olabilirler
-            
-            full_path = ""
-            if name == base_name: continue # Ana cihazı atla
-
-            # Device Path Kontrolü
-            if os.path.exists(f"/dev/mapper/{name}"):
-                full_path = f"/dev/mapper/{name}"
-            elif os.path.exists(f"/dev/{name}"):
-                full_path = f"/dev/{name}"
-            
-            if full_path:
-                partitions.append((full_path, int(size_str)))
+            if not parts or not parts[0].isdigit():
+                continue
+                
+            try:
+                start_sector = int(parts[0])
+                total_sectors = int(parts[1])
+                size_bytes = total_sectors * sector_size
+                offset_bytes = start_sector * sector_size
+                
+                partitions.append({
+                    "offset": offset_bytes,
+                    "size": size_bytes
+                })
+            except:
+                continue
 
         if not partitions:
-            print("-> No partitions found via lsblk. Trying direct mapper check...")
-            # Fallback: /dev/mapper kontrolü
-            if os.path.exists(f"/dev/mapper/{base_name}p1"):
-                return f"/dev/mapper/{base_name}p1"
-            if os.path.exists(f"/dev/mapper/{base_name}p2"): # Genelde p2 daha büyüktür (rootfs)
-                return f"/dev/mapper/{base_name}p2"
+            print("-> No partitions found. Assuming raw filesystem (Offset 0).")
+            return 0
             
-            print("-> Still no partitions. Assuming raw filesystem on main device.")
-            return device_path
-            
-        # En büyük partition'ı seç
-        largest_part = sorted(partitions, key=lambda x: x[1], reverse=True)[0]
-        print(f"-> Largest partition found: {largest_part[0]} (Size: {largest_part[1]} bytes)")
-        return largest_part[0]
+        # En büyük partition'ı bul
+        largest = sorted(partitions, key=lambda x: x["size"], reverse=True)[0]
+        print(f"-> Largest partition detected at Offset: {largest['offset']} (Size: {largest['size']})")
+        return largest["offset"]
 
     except Exception as e:
-        print(f"WARNING: Partition check failed: {e}. Defaulting to raw device.")
-        return device_path
+        print(f"WARNING: Partition analysis failed: {e}. Defaulting to Offset 0.")
+        return 0
 
 def cleanup():
     print("--- Starting Cleanup ---")
-    # Önce mount'u kaldır
+    global PARTITION_LOOP_DEV
+    
+    # 1. Mount'u kaldır
     run_command(["umount", "-l", MOUNT_POINT], check=False)
-    time.sleep(1)
-    # Mapper bağlantılarını temizle
-    run_command(["kpartx", "-d", LOOP_DEV], check=False)
-    run_command(["dmsetup", "remove_all"], check=False)
-    # Loop cihazını serbest bırak
-    run_command(["proxmox-backup-client", "unmap", LOOP_DEV], check=False)
+    
+    # 2. Partition Loop'u serbest bırak
+    if PARTITION_LOOP_DEV:
+        run_command(["losetup", "-d", PARTITION_LOOP_DEV], check=False)
+        PARTITION_LOOP_DEV = None
+    else:
+        # Garanti temizlik: /dev/loop0 üzerine kurulu diğer loopları bul ve sil
+        try:
+            out = subprocess.check_output(["losetup", "-a"], text=True)
+            for line in out.splitlines():
+                if MAIN_LOOP_DEV in line:
+                    loop_dev = line.split(':')[0]
+                    if loop_dev != MAIN_LOOP_DEV:
+                        run_command(["losetup", "-d", loop_dev], check=False)
+        except: pass
+
+    # 3. Ana Loop'u (PBS Map) serbest bırak
+    run_command(["proxmox-backup-client", "unmap", MAIN_LOOP_DEV], check=False)
     print("--- Cleanup Finished ---")
+
+def setup_partition_device(offset):
+    """
+    Ana disk üzerindeki belirli bir offset'e yeni bir loop cihazı bağlar.
+    Bu sayede partition'ı ayrı bir disk gibi görürüz.
+    """
+    global PARTITION_LOOP_DEV
+    if offset == 0:
+        return MAIN_LOOP_DEV
+    
+    print(f"-> Creating loop device for partition at offset {offset}...")
+    # losetup ile offset vererek yeni bir loop oluştur
+    result = run_command(["losetup", "--find", "--show", "--offset", str(offset), MAIN_LOOP_DEV])
+    PARTITION_LOOP_DEV = result.stdout.strip()
+    print(f"-> Partition mapped to: {PARTITION_LOOP_DEV}")
+    return PARTITION_LOOP_DEV
 
 def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
     print(f"\n--- Exploring Snapshot: {snapshot} Path: {path} ---")
     current_env = os.environ.copy()
-    
     cleanup() 
     run_command(["mkdir", "-p", MOUNT_POINT])
 
     try:
-        # 1. Map
+        # 1. Map (Diski getir)
         map_cmd = [
             "proxmox-backup-client", "map", snapshot, DRIVE_NAME,
             "--repository", config['pbs_repository_path']
         ]
         run_command(map_cmd, env=current_env)
-        time.sleep(2) # Map işleminin tamamlanmasını bekle
+        time.sleep(1)
 
-        # 2. Mount
-        target_partition = get_largest_partition(LOOP_DEV)
-        print(f"-> Attempting to mount: {target_partition}")
-        
+        # 2. Offset Bul ve Bağla
+        offset = get_largest_partition_offset(MAIN_LOOP_DEV)
+        target_dev = setup_partition_device(offset)
+
+        # 3. Mount Et (Hata toleranslı)
         try:
-            # Standart mount
-            run_command(["mount", "-o", "ro", target_partition, MOUNT_POINT])
-        except Exception as e:
-            print(f"Standard mount failed ({e}). Trying with explicit types...")
-            # XFS veya NTFS ise
+            # Önce auto detect ile dene
+            run_command(["mount", "-o", "ro", target_dev, MOUNT_POINT])
+        except:
             try:
-                run_command(["mount", "-t", "xfs", "-o", "ro,norecovery", target_partition, MOUNT_POINT])
+                # NTFS ise
+                run_command(["ntfs-3g", "-o", "ro", target_dev, MOUNT_POINT])
             except:
-                try:
-                    run_command(["ntfs-3g", "-o", "ro", target_partition, MOUNT_POINT])
-                except Exception as final_e:
-                    raise Exception(f"Failed to mount {target_partition}. Error: {final_e}")
+                # XFS/LVM ise (Genellikle norecovery gerekir)
+                run_command(["mount", "-o", "ro,norecovery", target_dev, MOUNT_POINT])
 
-        # 3. List Files
+        # 4. Listele
         safe_path = os.path.normpath(os.path.join(MOUNT_POINT, path.strip('/')))
-        if not safe_path.startswith(MOUNT_POINT):
-            safe_path = MOUNT_POINT
+        if not safe_path.startswith(MOUNT_POINT): safe_path = MOUNT_POINT
 
         if not os.path.exists(safe_path):
-            return {"status": "error", "message": f"Path '{path}' not found inside backup."}
+            return {"status": "error", "message": "Path not found"}
 
         items = []
         with os.scandir(safe_path) as entries:
             for entry in entries:
-                rel_path = os.path.relpath(entry.path, MOUNT_POINT)
                 items.append({
                     "name": entry.name,
                     "type": "dir" if entry.is_dir() else "file",
-                    "path": rel_path
+                    "path": os.path.relpath(entry.path, MOUNT_POINT)
                 })
         
         items.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
@@ -157,15 +180,13 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
     except Exception as e:
         print(f"Explore Error: {e}")
         return {"status": "error", "message": str(e)}
-    
     finally:
         cleanup()
 
 def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: str = "", source_paths: str = ""):
     print(f"\n{'='*60}\nSTARTING NEW STREAM PROCESS\n{'='*60}")
     print(f"Source: {snapshot}")
-    print(f"Target: {remote} (Folder: {target_folder})")
-
+    
     current_env = os.environ.copy()
     base_dir = current_env.get("PWD", "/")
 
@@ -173,6 +194,7 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         run_command(["mkdir", "-p", MOUNT_POINT])
         cleanup()
 
+        # 1. Map
         print(f"\n-> Mapping snapshot...")
         map_cmd = [
             "proxmox-backup-client", "map", snapshot, DRIVE_NAME,
@@ -181,50 +203,54 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         run_command(map_cmd, env=current_env)
         time.sleep(2)
 
-        print(f"\n-> Mounting filesystem...")
-        target_partition = get_largest_partition(LOOP_DEV)
+        # 2. Partition Offset & Mount
+        offset = get_largest_partition_offset(MAIN_LOOP_DEV)
+        target_dev = setup_partition_device(offset)
         
-        # Mount Logic (Retry Mechanism)
+        print(f"\n-> Mounting {target_dev}...")
         mounted = False
-        for opt in [["-o", "ro"], ["-t", "xfs", "-o", "ro,norecovery"], ["-t", "ext4", "-o", "ro"]]:
+        
+        # Mount stratejileri (Sırayla dener)
+        mount_attempts = [
+            ["mount", "-o", "ro", target_dev, MOUNT_POINT], # Auto (ext4 vb)
+            ["ntfs-3g", "-o", "ro", target_dev, MOUNT_POINT], # NTFS (Windows)
+            ["mount", "-t", "xfs", "-o", "ro,norecovery", target_dev, MOUNT_POINT] # XFS (CentOS/RHEL)
+        ]
+
+        last_error = ""
+        for cmd in mount_attempts:
             try:
-                run_command(["mount"] + opt + [target_partition, MOUNT_POINT])
+                run_command(cmd)
                 mounted = True
+                print("-> Mount successful.")
                 break
-            except:
+            except Exception as e:
+                last_error = str(e)
                 continue
         
         if not mounted:
-            # Last resort: NTFS
-            try:
-                run_command(["ntfs-3g", "-o", "ro", target_partition, MOUNT_POINT])
-                mounted = True
-            except:
-                raise Exception(f"Could not mount {target_partition} with any known filesystem.")
+            raise Exception(f"Failed to mount filesystem. Last error: {last_error}")
 
-        print(f"\n-> Streaming data...")
-        
+        # 3. Stream
         vmid = snapshot.split('/')[1]
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         archive_name = f"{vmid}_{timestamp}.tar.gz"
         
+        full_remote_path = f"{remote}:{archive_name}"
         if target_folder and target_folder.strip():
-            clean_folder = target_folder.strip().strip('/')
-            full_remote_path = f"{remote}:{clean_folder}/{archive_name}"
-        else:
-            full_remote_path = f"{remote}:{archive_name}"
+            full_remote_path = f"{remote}:{target_folder.strip().strip('/')}/{archive_name}"
 
         os.chdir(MOUNT_POINT)
-
+        
+        dirs_to_backup = ["."]
         if source_paths and source_paths.strip():
             dirs_to_backup = [p.strip() for p in source_paths.split(',') if p.strip()]
-        else:
-            dirs_to_backup = ["."]
 
         tar_cmd = ["tar", "cf", "-"] + dirs_to_backup
         pigz_cmd = ["pigz", "-1"]
         rclone_cmd = ["rclone", "rcat", full_remote_path, "-P", "--buffer-size", "128M"]
 
+        print("\n-> Streaming data...")
         with open(LOG_FILE_PATH, 'a') as log_file:
             p1 = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE, stderr=log_file, env=current_env)
             p2 = subprocess.Popen(pigz_cmd, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=log_file, env=current_env)
@@ -237,15 +263,11 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
             
             p3.wait()
 
-        if p1.wait() != 0: raise Exception("TAR failed.")
-        if p3.returncode != 0: raise Exception("RCLONE failed.")
-
+        if p3.returncode != 0: raise Exception("Upload failed.")
         print(f"\n-> SUCCESS! Backup uploaded to {full_remote_path}")
 
     except Exception as e:
         print(f"\nCRITICAL ERROR: {e}")
-    
     finally:
-        if os.getcwd() != base_dir:
-            os.chdir(base_dir)
+        if os.getcwd() != base_dir: os.chdir(base_dir)
         cleanup()
