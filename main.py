@@ -18,17 +18,14 @@ templates = Jinja2Templates(directory="templates")
 
 # --- KONFIGURASYON YÖNETİMİ ---
 def get_config():
-    """Ayarları yükler. Ayar yoksa None döner."""
     if not os.path.exists(CONFIG_FILE):
         return None
     try:
         with open(CONFIG_FILE, 'r') as f:
             config = json.load(f)
         
-        # Environment Variable'ları set et (Core.py ve subprocess'ler için)
         os.environ['RCLONE_CONFIG'] = RCLONE_CONFIG_PATH
         os.environ['PBS_PASSWORD'] = config.get("pbs_password", "")
-        # Repository stringini oluştur: user@realm@host:datastore
         os.environ['PBS_REPOSITORY'] = f"{config['pbs_user']}@{config['pbs_host']}:{config['pbs_repo']}"
         
         return config
@@ -52,7 +49,6 @@ async def handle_setup_form(
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         
-        # 1. JSON Config Kaydet
         config_data = {
             "pbs_host": pbs_host,
             "pbs_repo": pbs_repo,
@@ -62,14 +58,13 @@ async def handle_setup_form(
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config_data, f, indent=4)
 
-        # 2. Rclone Config Kaydet
         with open(RCLONE_CONFIG_PATH, 'w') as f:
             f.write(rclone_conf)
         os.chmod(RCLONE_CONFIG_PATH, 0o600)
 
         return templates.TemplateResponse("setup.html", {
             "request": request, 
-            "success_message": "Kurulum Başarılı! Yönlendiriliyorsunuz...",
+            "success_message": "Configuration Saved Successfully! Redirecting...",
             "redirect": True
         })
     except Exception as e:
@@ -83,11 +78,10 @@ async def read_root(request: Request, config: dict = Depends(get_config)):
 
     rclone_remotes = []
     try:
-        # Rclone config dosyasını env ile gösteriyoruz
         remotes_raw = subprocess.check_output("rclone listremotes", shell=True, env=os.environ).decode().strip()
         rclone_remotes = [line.strip() for line in remotes_raw.split('\n') if line]
     except Exception as e:
-        rclone_remotes = [f"HATA: {str(e)}"]
+        rclone_remotes = [f"ERROR: {str(e)}"]
 
     return templates.TemplateResponse("index.html", {
         "request": request, 
@@ -95,15 +89,43 @@ async def read_root(request: Request, config: dict = Depends(get_config)):
         "config": config
     })
 
+# --- YENİ EKLENEN FONKSİYON: TÜM VM'LERİ TARA ---
+@app.post("/scan-vms")
+async def scan_vms(config: dict = Depends(get_config)):
+    if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
+    
+    # Tüm snapshotları listele
+    cmd = f"proxmox-backup-client snapshot list --repository {os.environ['PBS_REPOSITORY']} | awk '{{print $2}}'"
+    try:
+        result = subprocess.check_output(cmd, shell=True, env=os.environ).decode().strip().split('\n')
+        # Sadece "vm/" veya "ct/" ile başlayanları al ve grupla
+        vms = set()
+        for line in result:
+            if line.startswith("vm/") or line.startswith("ct/"):
+                # Örn: vm/100/2023... -> vm/100
+                parts = line.split('/')
+                if len(parts) >= 2:
+                    vms.add(f"{parts[0]}/{parts[1]}") # vm/100
+        
+        sorted_vms = sorted(list(vms))
+        if not sorted_vms: return {"status": "error", "message": "No VMs found in repository."}
+        return {"status": "success", "vms": sorted_vms}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.post("/scan-snapshots")
 async def scan_snapshots(vmid: str = Form(...), config: dict = Depends(get_config)):
-    if not config: return JSONResponse({"status": "error", "message": "Ayar Yok"}, 401)
+    if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
     
-    cmd = f"proxmox-backup-client snapshot list --repository {os.environ['PBS_REPOSITORY']} | grep 'vm/{vmid}/' | awk '{{print $2}}' | sort -r"
+    # Gelen vmid "vm/100" formatındaysa sadece ID'yi almayalım, direkt filtreleyelim
+    # Kullanıcı "100" yazarsa da destekleyelim
+    filter_str = vmid if "/" in vmid else f"vm/{vmid}"
+    
+    cmd = f"proxmox-backup-client snapshot list --repository {os.environ['PBS_REPOSITORY']} | grep '{filter_str}' | awk '{{print $2}}' | sort -r"
     try:
         result = subprocess.check_output(cmd, shell=True, env=os.environ).decode().strip().split('\n')
         snapshots = [s for s in result if s]
-        if not snapshots: return {"status": "error", "message": "Yedek bulunamadı."}
+        if not snapshots: return {"status": "error", "message": "No snapshots found."}
         return {"status": "success", "snapshots": snapshots}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -115,7 +137,10 @@ async def start_stream(
     remote: str = Form(...),
     config: dict = Depends(get_config)
 ):
-    if not config: return JSONResponse({"status": "error", "message": "Ayar Yok"}, 401)
+    if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
     
     background_tasks.add_task(run_backup_process, snapshot, remote)
-    return {"status": "started", "message": f"İşlem Başlatıldı: {snapshot} -> {remote}"}
+    return {"status": "started", "message": f"Stream Started: {snapshot} -> {remote}"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
