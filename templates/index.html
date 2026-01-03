@@ -27,6 +27,8 @@
             --pbs-hint-bg: #e9ecef;
             --pbs-hint-text: #555;
             --pbs-modal-bg: #ffffff;
+            --pbs-dropdown-bg: #ffffff;
+            --pbs-dropdown-hover: #f0f0f0;
         }
 
         [data-theme="dark"] {
@@ -42,6 +44,8 @@
             --pbs-hint-bg: #2a2a2a;
             --pbs-hint-text: #ddd; 
             --pbs-modal-bg: #212121;
+            --pbs-dropdown-bg: #2c2c2c;
+            --pbs-dropdown-hover: #3a3a3a;
         }
 
         body {
@@ -56,20 +60,40 @@
             transition: all 0.3s;
         }
 
-        .form-control::placeholder {
-            color: #999;
-            opacity: 0.8;
+        /* --- CUSTOM DROPDOWN STYLE --- */
+        .custom-dropdown {
+            position: relative;
+            width: 100%;
         }
-        [data-theme="dark"] .form-control::placeholder {
-            color: #b0b0b0 !important; 
-            opacity: 1 !important;
+        .dropdown-list {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background-color: var(--pbs-dropdown-bg);
+            border: 1px solid var(--pbs-border);
+            border-top: none;
+            max-height: 200px;
+            overflow-y: auto;
+            z-index: 1000;
+            display: none;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }
-        
-        .form-text, .text-muted {
-            color: var(--pbs-text-muted) !important;
+        .dropdown-item {
+            padding: 8px 12px;
+            cursor: pointer;
+            color: var(--pbs-text-main);
+        }
+        .dropdown-item:hover {
+            background-color: var(--pbs-dropdown-hover);
         }
 
-        /* --- HEADER --- */
+        /* --- PLACEHOLDER & HINT COLORS FIX --- */
+        .form-control::placeholder { color: #999; opacity: 0.8; }
+        [data-theme="dark"] .form-control::placeholder { color: #b0b0b0 !important; opacity: 1 !important; }
+        .form-text, .text-muted { color: var(--pbs-text-muted) !important; }
+
+        /* --- HEADER & LAYOUT --- */
         .pbs-header {
             background-color: var(--pbs-bg-header);
             border-bottom: 2px solid var(--pbs-orange);
@@ -82,9 +106,9 @@
         }
         .logo-text { font-weight: 700; font-size: 18px; letter-spacing: 0.5px; }
         .logo-text span { color: var(--pbs-orange); }
-
         .header-actions { display: flex; align-items: center; gap: 15px; }
 
+        /* STATUS BADGES */
         .status-badge {
             font-size: 11px;
             padding: 4px 10px;
@@ -289,14 +313,14 @@
                         <div class="col-md-6">
                             <label class="form-label">Virtual Machine / Container</label>
                             
-                            <div class="input-group">
-                                <input class="form-control" list="vmListOptions" id="vmInput" placeholder="Select or Type VM ID..." onchange="loadSnapshots(this.value)">
-                                <datalist id="vmListOptions">
-                                    </datalist>
-                                
+                            <div class="input-group custom-dropdown">
+                                <input type="text" class="form-control" id="vmInput" placeholder="Select or Type VM ID..." autocomplete="off">
                                 <button class="btn-refresh" type="button" onclick="scanVMs()" title="Refresh VM List">
                                     <i class="bi bi-arrow-clockwise"></i>
                                 </button>
+                                
+                                <div id="vmList" class="dropdown-list">
+                                    </div>
                             </div>
                         </div>
 
@@ -410,7 +434,6 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 
     <script>
-        // ... (Theme Logic ve Diğer Fonksiyonlar Aynı Kalıyor) ...
         function setTheme(theme) {
             const html = document.documentElement;
             html.setAttribute('data-theme', theme);
@@ -428,78 +451,76 @@
         setTheme(savedTheme);
 
         const vmInput = document.getElementById("vmInput");
-        const vmListOptions = document.getElementById("vmListOptions");
+        const vmList = document.getElementById("vmList");
         const snapshotSelect = document.getElementById("snapshotSelect");
         const logWindow = document.getElementById("logWindow");
         const globalError = document.getElementById("globalError");
         const globalErrorText = document.getElementById("globalErrorText");
+
+        let allVMs = []; // Store VMs here
 
         document.addEventListener('DOMContentLoaded', () => {
             checkStatus();
             scanVMs();
         });
 
-        async function checkStatus() {
-            try {
-                const res = await fetch("/check-status");
-                const status = await res.json();
-                
-                updateBadge('pbsStatus', status.pbs);
-                updateBadge('rcloneStatus', status.rclone);
-
-                if (!status.pbs.status || !status.rclone.status) {
-                    let msg = "";
-                    if (!status.pbs.status) msg += `[PBS] ${status.pbs.msg} `;
-                    if (!status.rclone.status) msg += `[Cloud] ${status.rclone.msg}`;
-                    showGlobalError(msg);
-                } else {
-                    globalError.style.display = 'none';
-                }
-
-            } catch(e) {
-                console.error("Status check failed", e);
-                showGlobalError("Frontend could not reach Backend API.");
+        // --- CUSTOM DROPDOWN LOGIC ---
+        vmInput.addEventListener('focus', () => vmList.style.display = 'block');
+        
+        // Hide dropdown when clicking outside
+        document.addEventListener('click', (e) => {
+            if (!vmInput.contains(e.target) && !vmList.contains(e.target)) {
+                vmList.style.display = 'none';
             }
-        }
+        });
 
-        function updateBadge(id, statusObj) {
-            const badge = document.getElementById(id);
-            badge.className = 'status-badge ' + (statusObj.status ? 'status-online' : 'status-offline');
-            badge.title = statusObj.msg;
-        }
-
-        function showGlobalError(msg) {
-            globalError.style.display = 'block';
-            globalErrorText.innerText = msg;
-        }
-
-        function log(msg, type = 'info') {
-            logWindow.style.display = 'block';
-            const line = document.createElement('div');
-            line.className = 'log-line';
-            const time = new Date().toLocaleTimeString('en-US', { hour12: false });
-            let colorClass = type === 'error' ? 'log-error' : (type === 'success' ? 'log-success' : 'log-info');
-            line.innerHTML = `<span class="text-muted small">[${time}]</span> <span class="${colorClass}">${msg}</span>`;
-            logWindow.appendChild(line);
-            logWindow.scrollTop = logWindow.scrollHeight;
-        }
+        // Filter functionality
+        vmInput.addEventListener('input', () => {
+            const filter = vmInput.value.toUpperCase();
+            const items = vmList.getElementsByClassName("dropdown-item");
+            let hasVisible = false;
+            
+            for (let i = 0; i < items.length; i++) {
+                const txt = items[i].textContent || items[i].innerText;
+                if (txt.toUpperCase().indexOf(filter) > -1) {
+                    items[i].style.display = "";
+                    hasVisible = true;
+                } else {
+                    items[i].style.display = "none";
+                }
+            }
+            
+            if (!hasVisible && filter.length > 0) {
+                // If no match, show manual entry suggestion (optional)
+            }
+            vmList.style.display = 'block';
+        });
 
         async function scanVMs() {
-            // Placeholder ile loading gösterilebilir, ama datalist'i temizleyelim
-            vmListOptions.innerHTML = '';
-            
+            vmList.innerHTML = '<div class="p-2 text-muted">Scanning...</div>';
             try {
                 const response = await fetch("/scan-vms", {method: "POST"});
                 const data = await response.json();
                 
+                vmList.innerHTML = '';
+                allVMs = [];
+
                 if (data.status === 'success') {
-                    data.vms.forEach(vm => {
-                        const option = document.createElement('option');
-                        option.value = vm;
-                        vmListOptions.appendChild(option);
+                    allVMs = data.vms;
+                    allVMs.forEach(vm => {
+                        const div = document.createElement("div");
+                        div.className = "dropdown-item";
+                        div.textContent = vm;
+                        div.onclick = () => {
+                            vmInput.value = vm;
+                            vmList.style.display = 'none';
+                            loadSnapshots(vm);
+                        };
+                        vmList.appendChild(div);
                     });
                 } else {
                     log("VM Scan Failed: " + data.message, "error");
+                    vmList.innerHTML = '<div class="p-2 text-danger">Scan Failed</div>';
                 }
             } catch (e) {
                 log("Network Error during VM Scan", "error");
@@ -532,7 +553,50 @@
             }
         }
 
-        // ... (Diğer fonksiyonlar: startBackup, openExplorer, vb. AYNI KALIYOR) ...
+        // --- (Diğer JS fonksiyonları aynen kalıyor...) ---
+        
+        async function checkStatus() {
+            try {
+                const res = await fetch("/check-status");
+                const status = await res.json();
+                updateBadge('pbsStatus', status.pbs);
+                updateBadge('rcloneStatus', status.rclone);
+                if (!status.pbs.status || !status.rclone.status) {
+                    let msg = "";
+                    if (!status.pbs.status) msg += `[PBS] ${status.pbs.msg} `;
+                    if (!status.rclone.status) msg += `[Cloud] ${status.rclone.msg}`;
+                    showGlobalError(msg);
+                } else {
+                    globalError.style.display = 'none';
+                }
+            } catch(e) {
+                console.error("Status check failed", e);
+                showGlobalError("Frontend could not reach Backend API.");
+            }
+        }
+
+        function updateBadge(id, statusObj) {
+            const badge = document.getElementById(id);
+            badge.className = 'status-badge ' + (statusObj.status ? 'status-online' : 'status-offline');
+            badge.title = statusObj.msg;
+        }
+
+        function showGlobalError(msg) {
+            globalError.style.display = 'block';
+            globalErrorText.innerText = msg;
+        }
+
+        function log(msg, type = 'info') {
+            logWindow.style.display = 'block';
+            const line = document.createElement('div');
+            line.className = 'log-line';
+            const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+            let colorClass = type === 'error' ? 'log-error' : (type === 'success' ? 'log-success' : 'log-info');
+            line.innerHTML = `<span class="text-muted small">[${time}]</span> <span class="${colorClass}">${msg}</span>`;
+            logWindow.appendChild(line);
+            logWindow.scrollTop = logWindow.scrollHeight;
+        }
+
         async function startBackup() {
             const snapshot = snapshotSelect.value;
             const remote = document.getElementById("remoteSelect").value;

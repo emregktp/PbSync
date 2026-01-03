@@ -3,6 +3,7 @@ import subprocess
 import time
 import shutil
 import glob
+import json
 
 # --- Constants ---
 DRIVE_NAME = "drive-scsi0.img"
@@ -20,6 +21,7 @@ def run_command(command, shell=False, check=True, env=None):
         result = subprocess.run(
             command, shell=shell, check=check, capture_output=True, text=True, env=process_env
         )
+        # Logları temiz tut
         if result.stdout and not "lsblk" in cmd_str: 
             print(f"STDOUT: {result.stdout.strip()[:200]}...")
         if result.stderr: 
@@ -40,63 +42,74 @@ def cleanup():
     run_command(["proxmox-backup-client", "unmap", MAIN_LOOP_DEV], check=False)
     print("--- Cleanup Finished ---")
 
-def get_block_device_size(device_path):
+def get_mount_candidates():
     """
-    Returns the size of a block device in bytes.
+    Diskin yapısını (Raw, Partitioned, LVM) analiz eder ve 
+    mount edilebilecek adayların yollarını döndürür.
     """
+    print(f"-> Analyzing block device structure...")
+    
+    # 1. lsblk ile JSON çıktısı al (Hiyerarşiyi görmek için)
+    # loop0 ve altındaki tüm cihazları listele
     try:
-        res = run_command(["blockdev", "--getsize64", device_path])
-        return int(res.stdout.strip())
-    except:
-        return 0
+        cmd = ["lsblk", "-J", "-b", "-o", "NAME,TYPE,SIZE,FSTYPE,PKNAME"]
+        res = run_command(cmd)
+        data = json.loads(res.stdout)
+    except Exception as e:
+        print(f"lsblk failed: {e}")
+        return [MAIN_LOOP_DEV] # Fallback
 
-def find_all_candidates():
-    """
-    Finds all mapped partitions and LVM volumes.
-    Returns a list of device paths sorted by size (largest first).
-    """
     candidates = []
-    
-    # 1. Check standard partitions mapped by kpartx (/dev/mapper/loop0p*)
-    partitions = glob.glob("/dev/mapper/loop0p*")
-    for p in partitions:
-        candidates.append(p)
 
-    # 2. Check LVM Volumes (Everything in /dev/mapper that isn't loop0p*)
-    #    Be careful not to include control devices.
-    all_mappers = glob.glob("/dev/mapper/*")
-    for m in all_mappers:
-        if m not in partitions and "control" not in m and "loop0" not in m:
-            candidates.append(m)
+    def find_children(devices, parent_name="loop0"):
+        found = []
+        for dev in devices:
+            # Device is loop0 or a child of loop0
+            if dev['name'] == parent_name or dev.get('pkname') == parent_name:
+                
+                # Recursive check for children (partitions/LVM)
+                if 'children' in dev:
+                    for child in dev['children']:
+                        found.extend(find_children([child], child['name']))
+                
+                # Kendisi bir aday mı? (loop0'ın kendisi ise ve çocuğu yoksa, ya da partition/lvm ise)
+                is_partition = dev['type'] in ['part', 'lvm']
+                is_raw_disk = dev['type'] == 'loop' and 'children' not in dev
+                
+                if is_partition or is_raw_disk:
+                    # Tam yolu oluştur
+                    dev_path = f"/dev/{dev['name']}"
+                    if os.path.exists(f"/dev/mapper/{dev['name']}"):
+                        dev_path = f"/dev/mapper/{dev['name']}"
+                    
+                    found.append((dev_path, int(dev['size'])))
+        return found
 
-    # 3. Sort by size
-    candidates_with_size = []
-    for dev in candidates:
-        size = get_block_device_size(dev)
-        if size > 0:
-            candidates_with_size.append((dev, size))
+    # Loop0 altındaki her şeyi bul
+    candidates_raw = find_children(data.get('blockdevices', []), "loop0")
     
-    # Sort largest first
-    candidates_with_size.sort(key=lambda x: x[1], reverse=True)
+    # Boyuta göre sırala (En büyük en üstte)
+    candidates_raw.sort(key=lambda x: x[1], reverse=True)
     
-    # Just return paths
-    return [x[0] for x in candidates_with_size]
+    # Sadece yolları döndür
+    final_list = [x[0] for x in candidates_raw]
+    
+    if not final_list:
+        print("-> No logical partitions found. Defaulting to raw device.")
+        return [MAIN_LOOP_DEV]
+    
+    print(f"-> Candidates found: {final_list}")
+    return final_list
 
 def try_mount(device_path):
-    """
-    Attempts to mount a device with various filesystem types.
-    Returns True if successful.
-    """
     print(f"-> Trying to mount candidate: {device_path}")
-    
     if not os.path.exists(MOUNT_POINT): os.makedirs(MOUNT_POINT)
 
-    # List of mount strategies to try
     strategies = [
-        ["mount", "-o", "ro", device_path, MOUNT_POINT], # Auto-detect
-        ["mount", "-t", "xfs", "-o", "ro,norecovery", device_path, MOUNT_POINT], # XFS explicit
-        ["ntfs-3g", "-o", "ro,remove_hiberfile", device_path, MOUNT_POINT], # NTFS explicit
-        ["mount", "-t", "ext4", "-o", "ro", device_path, MOUNT_POINT] # EXT4 explicit
+        ["mount", "-o", "ro", device_path, MOUNT_POINT], # Auto
+        ["mount", "-t", "xfs", "-o", "ro,norecovery", device_path, MOUNT_POINT], # XFS
+        ["ntfs-3g", "-o", "ro,remove_hiberfile", device_path, MOUNT_POINT], # NTFS
+        ["mount", "-t", "ext4", "-o", "ro", device_path, MOUNT_POINT] # EXT4
     ]
 
     for cmd in strategies:
@@ -106,7 +119,6 @@ def try_mount(device_path):
             return True
         except:
             continue
-            
     return False
 
 def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
@@ -124,23 +136,17 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
         run_command(map_cmd, env=current_env)
         time.sleep(2)
 
-        # 2. Activate Partitions & LVM
+        # 2. Activate Structures
         try: run_command(["kpartx", "-a", "-v", "-s", MAIN_LOOP_DEV])
         except: pass
-        
         try: 
             run_command(["vgscan", "--mknodes"], check=False)
             run_command(["vgchange", "-ay"], check=False)
         except: pass
-        
         time.sleep(1)
 
-        # 3. Find candidates and Try Mount
-        candidates = find_all_candidates()
-        if not candidates:
-            # Fallback: Try mounting the raw loop device (rare but possible)
-            candidates = [MAIN_LOOP_DEV]
-
+        # 3. Find & Mount
+        candidates = get_mount_candidates()
         mounted = False
         for dev in candidates:
             if try_mount(dev):
@@ -148,7 +154,7 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
                 break
         
         if not mounted:
-            return {"status": "error", "message": "Could not mount any partition in backup."}
+            return {"status": "error", "message": "Could not mount any partition/volume."}
 
         # 4. List Files
         safe_path = os.path.normpath(os.path.join(MOUNT_POINT, path.strip('/')))
@@ -195,8 +201,8 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         run_command(map_cmd, env=current_env)
         time.sleep(2)
 
-        # 2. Activate Partitions & LVM
-        print("-> Activating partitions...")
+        # 2. Activate
+        print("-> Activating partitions/LVM...")
         try: run_command(["kpartx", "-a", "-v", "-s", MAIN_LOOP_DEV])
         except: pass
         try: 
@@ -205,10 +211,8 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         except: pass
         time.sleep(1)
 
-        # 3. Mount Strategy (Brute Force)
-        candidates = find_all_candidates()
-        if not candidates: candidates = [MAIN_LOOP_DEV]
-        
+        # 3. Mount
+        candidates = get_mount_candidates()
         mounted = False
         for dev in candidates:
             if try_mount(dev):
@@ -218,7 +222,7 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         if not mounted:
             raise Exception("Failed to mount any filesystem from the snapshot.")
 
-        # 4. Stream Setup
+        # 4. Stream
         vmid = snapshot.split('/')[1]
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         archive_name = f"{vmid}_{timestamp}.tar.gz"
