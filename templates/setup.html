@@ -35,15 +35,9 @@
             --pbs-hint-bg: #2a2a2a;
         }
 
-        /* --- PLACEHOLDER FIX FOR DARK MODE --- */
-        .form-control::placeholder {
-            color: #6c757d;
-            opacity: 0.7;
-        }
-        [data-theme="dark"] .form-control::placeholder {
-            color: rgba(255, 255, 255, 0.5) !important; /* Daha parlak */
-            opacity: 1;
-        }
+        /* PLACEHOLDER FIX */
+        .form-control::placeholder { color: #6c757d; opacity: 0.7; }
+        [data-theme="dark"] .form-control::placeholder { color: rgba(255, 255, 255, 0.5) !important; opacity: 1; }
 
         body {
             background-color: var(--pbs-bg-body);
@@ -155,14 +149,6 @@
 
     <div class="setup-container">
         
-        {% if success_message %}
-        <div class="pbs-card text-center p-5">
-            <h3 class="mb-3 text-success">Configuration Saved</h3>
-            <p>{{ success_message }}</p>
-            <script>setTimeout(function(){ window.location.href = "/"; }, 2000);</script>
-        </div>
-        {% else %}
-        
         <div class="pbs-card">
             <div class="pbs-card-header">
                 <i class="bi bi-sliders me-2"></i> System Configuration
@@ -192,6 +178,14 @@
                             <label class="form-label">Password</label>
                             <input type="password" name="pbs_password" class="form-control" required>
                         </div>
+                        <div class="col-12">
+                            <label class="form-label">PBS Fingerprint (Recommended)</label>
+                            <div class="form-hint">
+                                If you use a self-signed certificate, you <b>must</b> provide the fingerprint. 
+                                Found in PBS Dashboard > Dashboard > Show Fingerprint.
+                            </div>
+                            <input type="text" name="pbs_fingerprint" class="form-control" placeholder="e.g. 8d:4f:...">
+                        </div>
                     </div>
 
                     <h6 class="text-uppercase small fw-bold mb-3" style="color: var(--pbs-orange);">Cloud Storage (Rclone)</h6>
@@ -210,7 +204,6 @@
                 </form>
             </div>
         </div>
-        {% endif %}
     </div>
 
     <script>

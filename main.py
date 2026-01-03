@@ -18,31 +18,31 @@ templates = Jinja2Templates(directory="templates")
 
 # --- KONFIGURASYON YÖNETİMİ ---
 def get_config():
-    # Eğer dosya hiç yoksa -> Setup'a git (None dön)
     if not os.path.exists(CONFIG_FILE):
         return None
     
-    # Dosya var ama bozuksa veya okunamazsa -> Yine de Dashboard'u aç (Boş config dön)
     try:
         with open(CONFIG_FILE, 'r') as f:
             config = json.load(f)
     except Exception as e:
         print(f"CONFIG LOAD ERROR: {e}")
-        # Hatalı dosya durumunda varsayılan boş bir config dönüyoruz ki Setup'a atmasın.
-        config = {
-            "pbs_user": "error", "pbs_host": "config-error", 
-            "pbs_repo": "check-logs", "pbs_password": ""
-        }
+        # Hata durumunda boş dön ki setup'a yönlendirsin
+        return None
 
-    # Ortam Değişkenlerini Ayarla
+    # Environment Variable'ları set et
     os.environ['RCLONE_CONFIG'] = RCLONE_CONFIG_PATH
     
     pbs_user = config.get('pbs_user', 'root@pam')
     pbs_host = config.get('pbs_host', 'localhost')
     pbs_repo = config.get('pbs_repo', 'backup')
     pbs_pass = config.get('pbs_password', '')
+    pbs_fingerprint = config.get('pbs_fingerprint', '') # Yeni eklenen alan
 
     os.environ['PBS_PASSWORD'] = pbs_pass
+    
+    # Fingerprint varsa environment'a ekle (SSL hatasını çözer)
+    if pbs_fingerprint and pbs_fingerprint.strip():
+        os.environ['PBS_FINGERPRINT'] = pbs_fingerprint.strip()
     
     repo = f"{pbs_user}@{pbs_host}:{pbs_repo}"
     os.environ['PBS_REPOSITORY'] = repo
@@ -61,6 +61,7 @@ async def handle_setup_form(
     pbs_repo: str = Form(...),
     pbs_user: str = Form(...),
     pbs_password: str = Form(...),
+    pbs_fingerprint: str = Form(None), # Opsiyonel yeni alan
     rclone_conf: str = Form(...)
 ):
     try:
@@ -70,7 +71,8 @@ async def handle_setup_form(
             "pbs_host": pbs_host.strip(),
             "pbs_repo": pbs_repo.strip(),
             "pbs_user": pbs_user.strip(),
-            "pbs_password": pbs_password.strip()
+            "pbs_password": pbs_password.strip(),
+            "pbs_fingerprint": pbs_fingerprint.strip() if pbs_fingerprint else ""
         }
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config_data, f, indent=4)
@@ -79,19 +81,14 @@ async def handle_setup_form(
             f.write(rclone_conf.strip())
         os.chmod(RCLONE_CONFIG_PATH, 0o600)
 
-        # BURASI DEĞİŞTİ:
-        # Başarılı kayıttan sonra direkt Ana Sayfaya yönlendir (303).
-        # Böylece "Success" ekranında bekleme veya JS redirect sorunu kalmaz.
         return RedirectResponse(url="/", status_code=303)
         
     except Exception as e:
-        # Kayıt hatası varsa setup sayfasında hatayı göster
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 # --- DASHBOARD ENDPOINTS ---
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request, config: dict = Depends(get_config)):
-    # Config dosyası fiziksel olarak yoksa setup'a at
     if config is None:
         return RedirectResponse(url="/setup")
 
@@ -108,7 +105,7 @@ async def read_root(request: Request, config: dict = Depends(get_config)):
         "config": config
     })
 
-# --- STATUS CHECK (GELİŞMİŞ) ---
+# --- STATUS CHECK ---
 @app.get("/check-status")
 async def check_status(config: dict = Depends(get_config)):
     if not config: 
@@ -121,18 +118,16 @@ async def check_status(config: dict = Depends(get_config)):
     
     # 1. PBS Kontrolü
     try:
-        # stderr'i yakalayalım ki hatayı ekrana basabilelim
         subprocess.run(
             f"proxmox-backup-client snapshot list --repository {os.environ['PBS_REPOSITORY']} --output-format json-pretty", 
             shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=os.environ
         )
         response["pbs"] = {"status": True, "msg": "Connected"}
     except subprocess.CalledProcessError as e:
-        # Hatayı temizle ve özeti al
         err_msg = e.stderr.decode().strip() or "Connection Failed"
-        # Çok uzun hataları kısalt
-        if "500 Internal Server Error" in err_msg: err_msg = "500 Internal Server Error (Check PBS Logs)"
-        if "authentication failed" in err_msg.lower(): err_msg = "Authentication Failed (Check Password)"
+        # SSL Hatasını yakala ve kullanıcı dostu mesaj ver
+        if "fingerprint" in err_msg.lower():
+            err_msg = "SSL Error: Fingerprint mismatch or missing!"
         response["pbs"] = {"status": False, "msg": err_msg}
     except Exception as e:
         response["pbs"] = {"status": False, "msg": str(e)}
@@ -142,7 +137,7 @@ async def check_status(config: dict = Depends(get_config)):
         subprocess.run("rclone listremotes", shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=os.environ)
         response["rclone"] = {"status": True, "msg": "Ready"}
     except subprocess.CalledProcessError as e:
-        response["rclone"] = {"status": False, "msg": "Config Error: " + e.stderr.decode().strip()}
+        response["rclone"] = {"status": False, "msg": "Config Error"}
     except Exception as e:
         response["rclone"] = {"status": False, "msg": str(e)}
         
@@ -164,11 +159,11 @@ async def scan_vms(config: dict = Depends(get_config)):
                 vms.add(f"{item['backup-type']}/{item['backup-id']}")
         
         sorted_vms = sorted(list(vms))
-        if not sorted_vms: return {"status": "error", "message": "Repository is empty (No backups found)."}
+        if not sorted_vms: return {"status": "error", "message": "No backups found in repository."}
         return {"status": "success", "vms": sorted_vms}
         
     except subprocess.CalledProcessError as e:
-        return {"status": "error", "message": f"PBS Error: {e.output.decode() if e.output else str(e)}"}
+        return {"status": "error", "message": f"PBS Error: {e.output.decode() if e.output else 'Check Logs'}"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -195,7 +190,7 @@ async def start_stream(
     config: dict = Depends(get_config)
 ):
     if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
-    background_tasks.add_task(run_backup_process, config, snapshot, remote) # Parametre sırasını düzelttim
+    background_tasks.add_task(run_backup_process, config, snapshot, remote)
     return {"status": "started", "message": f"Stream Started: {snapshot} -> {remote}"}
 
 if __name__ == "__main__":
