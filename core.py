@@ -32,17 +32,10 @@ def run_command(command, shell=False, check=True, env=None):
 
 def cleanup():
     print("--- Starting Cleanup ---")
-    # 1. Unmount
     run_command(["umount", "-l", MOUNT_POINT], check=False)
-    
-    # 2. Deactivate LVM
     run_command(["vgchange", "-an"], check=False)
-    
-    # 3. Clean up partition mappings
     run_command(["kpartx", "-d", MAIN_LOOP_DEV], check=False)
     run_command(["dmsetup", "remove_all"], check=False)
-
-    # 4. Unmap main drive
     run_command(["proxmox-backup-client", "unmap", MAIN_LOOP_DEV], check=False)
     print("--- Cleanup Finished ---")
 
@@ -50,7 +43,7 @@ def detect_and_mount():
     """
     1. Haritalama (kpartx)
     2. LVM Aktivasyonu (vgchange)
-    3. Mount edilebilir alanları (ext4, xfs, ntfs) bulma
+    3. Mount edilebilir alanları bulma (lsblk ile genel tarama + filtreleme)
     4. En büyüğünü mount etme
     """
     print(f"-> Scanning block devices on {MAIN_LOOP_DEV}...")
@@ -60,50 +53,59 @@ def detect_and_mount():
         run_command(["kpartx", "-a", "-v", "-s", MAIN_LOOP_DEV])
     except: pass
     
-    # B. LVM Yapılarını Tanıt (Linux VM'ler için kritik)
+    # B. LVM Yapılarını Tanıt
     try:
         run_command(["vgscan", "--mknodes"], check=False)
         run_command(["vgchange", "-ay"], check=False)
     except: pass
 
-    time.sleep(2) # Kernel'in cihazları oluşturmasını bekle
+    time.sleep(2)
 
     # C. Mount Edilebilir Dosya Sistemlerini Bul
-    # KRİTİK DÜZELTME: Sadece MAIN_LOOP_DEV içindeki cihazları listele
-    # Ana disk (sda) karışmasın diye parametre eklendi.
-    cmd = ["lsblk", "-r", "-n", "-o", "NAME,FSTYPE,SIZE", MAIN_LOOP_DEV]
+    # DÜZELTME: lsblk'ya doğrudan /dev/loop0 VERMİYORUZ (Hata 32'yi engeller).
+    # Hepsini listele, Python ile filtrele.
+    cmd = ["lsblk", "-r", "-n", "-o", "NAME,FSTYPE,SIZE"]
     result = run_command(cmd)
     
     candidates = []
     
     for line in result.stdout.splitlines():
         parts = line.split()
-        if len(parts) < 2: continue # FSTYPE yoksa atla
+        if len(parts) < 2: continue
         
-        name = parts[0]
-        fstype = parts[1]
+        name = parts[0]     # örn: loop0p1, dm-0
+        fstype = parts[1]   # örn: ext4, xfs, LVM2_member
         size = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
         
-        # Gereksizleri filtrele
+        # Sadece loop0 ile alakalı olanları veya mapper (LVM/kpartx) cihazlarını al
+        # loop0 partitionları genelde 'loop0p1' veya 'dm-' olarak görünür.
+        # Basit filtre: Ana disklerimiz loop0 veya mapper altında olmalı.
+        
+        is_relevant = False
+        full_path = ""
+
+        if "loop0" in name:
+            is_relevant = True
+            full_path = f"/dev/{name}"
+        elif os.path.exists(f"/dev/mapper/{name}"):
+            # Mapper cihazları (kpartx veya LVM) her zaman potansiyel adaydır
+            is_relevant = True
+            full_path = f"/dev/mapper/{name}"
+        
+        if not is_relevant: continue
+
+        # Gereksiz türleri ele
         if fstype in ['LVM2_member', 'swap', 'iso9660', 'linux_raid_member']: 
             continue
-        if not fstype: continue
+        if not fstype: continue # Fstype boşsa (raw partition) atla
 
-        # Tam yolu oluştur
-        dev_path = f"/dev/{name}"
-        # Eğer /dev/mapper altında ise (LVM veya kpartx) orayı kullan
-        if os.path.exists(f"/dev/mapper/{name}"):
-            dev_path = f"/dev/mapper/{name}"
-            
-        candidates.append({"path": dev_path, "fstype": fstype, "size": size})
+        candidates.append({"path": full_path, "fstype": fstype, "size": size})
 
     if not candidates:
-        # Aday bulunamadıysa loglara daha detaylı bilgi bas
-        print("DEBUG: lsblk output was:")
-        print(result.stdout)
-        raise Exception(f"No mountable filesystems (ext4/xfs/ntfs) detected inside {MAIN_LOOP_DEV}! Disk might be encrypted or raw.")
+        print("DEBUG: lsblk output:\n", result.stdout)
+        raise Exception(f"No mountable filesystems (ext4/xfs/ntfs) detected associated with backup!")
 
-    # En büyüğünü seç (Genellikle data partition'ıdır)
+    # En büyüğünü seç
     target = sorted(candidates, key=lambda x: x["size"], reverse=True)[0]
     target_dev = target["path"]
     target_fs = target["fstype"]
@@ -113,7 +115,7 @@ def detect_and_mount():
     # D. Mount İşlemi
     if not os.path.exists(MOUNT_POINT): os.makedirs(MOUNT_POINT)
     
-    mount_opts = ["mount", "-o", "ro"] # Read-only varsayılan
+    mount_opts = ["mount", "-o", "ro"]
     
     if target_fs == "xfs":
         mount_opts = ["mount", "-t", "xfs", "-o", "ro,norecovery"]
