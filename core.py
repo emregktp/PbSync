@@ -34,21 +34,42 @@ def run_command(command, shell=False, check=True, env=None):
 def get_largest_partition(device_path):
     """
     Finds the largest partition within a given block device.
+    Supports standard /dev/loop0p1 and /dev/mapper/loop0p1 (kpartx).
     """
     print(f"-> Searching for the largest partition in '{device_path}'...")
     try:
+        # Refresh partition table visibility just in case
+        run_command(["kpartx", "-a", "-v", device_path], check=False)
+        time.sleep(1)
+
         cmd = ["lsblk", "-nr", "-o", "NAME,SIZE", "-b", device_path]
         result = run_command(cmd)
         partitions = []
+        
+        base_name = os.path.basename(device_path) # loop0
+        
         for line in result.stdout.strip().split('\n'):
             parts = line.split()
-            # lsblk output usually looks like 'loop0p1'
-            if len(parts) == 2 and parts[0].startswith(os.path.basename(device_path) + 'p'):
-                name, size_str = parts
-                partitions.append((f"/dev/{name}", int(size_str)))
+            if len(parts) != 2: continue
+            
+            name, size_str = parts
+            
+            # Check for loop0p1 or mapper paths
+            # lsblk output for mapper might act differently, but usually shows dependencies
+            if name.startswith(base_name + 'p') or name.startswith(base_name + '-part'):
+                # Construct full path. lsblk usually outputs bare names like loop0p1
+                if os.path.exists(f"/dev/{name}"):
+                    full_path = f"/dev/{name}"
+                elif os.path.exists(f"/dev/mapper/{name}"):
+                    full_path = f"/dev/mapper/{name}"
+                else:
+                    # Fallback assumption
+                    full_path = f"/dev/{name}"
+                    
+                partitions.append((full_path, int(size_str)))
 
         if not partitions:
-            print("-> No partitions found, using the main device.")
+            print("-> No partitions found (Raw filesystem?), using the main device.")
             return device_path
             
         largest_part = sorted(partitions, key=lambda x: x[1], reverse=True)[0]
@@ -65,6 +86,7 @@ def cleanup():
     """
     print("--- Starting Cleanup ---")
     run_command(["umount", "-l", MOUNT_POINT], check=False)
+    run_command(["kpartx", "-d", LOOP_DEV], check=False) # Remove partition mappings
     run_command(["proxmox-backup-client", "unmap", LOOP_DEV], check=False)
     print("--- Cleanup Finished ---")
 
@@ -93,9 +115,10 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
         target_partition = get_largest_partition(LOOP_DEV)
         try:
             # Try read-only with norecovery (faster/safer for backups)
+            # Try mounting with explicit types if auto fails (common for XFS/NTFS in containers)
             run_command(["mount", "-o", "ro,norecovery", target_partition, MOUNT_POINT])
-        except:
-            # Fallback
+        except Exception as e:
+            print(f"Standard mount failed: {e}. Trying simple mount...")
             run_command(["mount", "-o", "ro", target_partition, MOUNT_POINT])
 
         # 3. List Files
@@ -110,7 +133,6 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
         items = []
         with os.scandir(safe_path) as entries:
             for entry in entries:
-                # Get relative path for the API
                 rel_path = os.path.relpath(entry.path, MOUNT_POINT)
                 
                 items.append({
@@ -119,7 +141,6 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
                     "path": rel_path
                 })
         
-        # Sort: Directories first, then files (alphabetical)
         items.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
         
         return {"status": "success", "items": items, "current_path": path}
@@ -129,7 +150,6 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
         return {"status": "error", "message": str(e)}
     
     finally:
-        # Always cleanup immediately after listing to free resources
         cleanup()
 
 def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: str = "", source_paths: str = ""):
@@ -173,7 +193,6 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         # 4. Stream & Upload
         print(f"\n-> [Step 3/4] Preparing stream pipeline...")
         
-        # File Name: vmid_Date.tar.gz
         vmid = snapshot.split('/')[1]
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         archive_name = f"{vmid}_{timestamp}.tar.gz"
@@ -191,10 +210,8 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
 
         # Process Source Paths
         if source_paths and source_paths.strip():
-            # Convert comma-separated string to list
             dirs_to_backup = [p.strip() for p in source_paths.split(',') if p.strip()]
         else:
-            # Backup everything
             dirs_to_backup = ["."]
 
         print(f"   Backup Source Paths: {dirs_to_backup}")
@@ -216,7 +233,6 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
             p3 = subprocess.Popen(rclone_cmd, stdin=p2.stdout, stderr=subprocess.PIPE, text=True, env=current_env)
             p2.stdout.close()
 
-            # Read Rclone Progress
             for line in iter(p3.stderr.readline, ''):
                 print(f"   [Cloud] {line.strip()}")
             
