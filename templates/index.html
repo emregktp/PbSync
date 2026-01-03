@@ -18,11 +18,15 @@
             --pbs-border: #cccccc;
             --pbs-input-bg: #ffffff;
             --pbs-input-text: #333333;
+            --pbs-input-disabled: #e9ecef;
             --pbs-orange: #E57000;
             --pbs-blue: #3892d6;
             --pbs-green: #21ba45;
             --pbs-red: #ff4d4d;
             --pbs-header-text: #ffffff;
+            --pbs-hint-bg: #e9ecef;
+            --pbs-hint-text: #555;
+            --pbs-modal-bg: #ffffff;
         }
 
         [data-theme="dark"] {
@@ -34,6 +38,10 @@
             --pbs-border: #383838;
             --pbs-input-bg: #121212;
             --pbs-input-text: #e0e0e0;
+            --pbs-input-disabled: #2a2a2a;
+            --pbs-hint-bg: #2a2a2a;
+            --pbs-hint-text: #ccc;
+            --pbs-modal-bg: #212121;
         }
 
         body {
@@ -136,15 +144,43 @@
 
         /* --- FORMS --- */
         .form-label { color: var(--pbs-text-main); font-weight: 600; font-size: 13px; margin-bottom: 6px; display: block; }
+        
         .form-control, .form-select {
             background-color: var(--pbs-input-bg); border: 1px solid var(--pbs-border);
             color: var(--pbs-input-text); border-radius: 3px; font-size: 14px; padding: 10px;
         }
+        
+        .form-control:disabled, .form-select:disabled {
+            background-color: var(--pbs-input-disabled) !important;
+            color: var(--pbs-text-muted);
+            border-color: var(--pbs-border);
+            opacity: 1;
+        }
+
         .form-control:focus, .form-select:focus {
             background-color: var(--pbs-input-bg); border-color: var(--pbs-blue);
             color: var(--pbs-input-text); box-shadow: 0 0 0 2px rgba(56, 146, 214, 0.2);
         }
         
+        /* HINT BOX */
+        .form-hint-box {
+            font-size: 0.85em;
+            color: var(--pbs-hint-text);
+            background-color: var(--pbs-hint-bg);
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin-top: 6px;
+            border-left: 3px solid var(--pbs-blue);
+            line-height: 1.4;
+        }
+        .form-hint-box code {
+            color: var(--pbs-blue);
+            font-family: 'Roboto Mono', monospace;
+            background: rgba(56, 146, 214, 0.1);
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+
         .btn-pbs {
             background-color: var(--pbs-blue); color: white; border: none;
             border-radius: 3px; font-weight: 600; padding: 10px 20px;
@@ -161,16 +197,33 @@
         .btn-refresh:hover { background-color: var(--pbs-hover); }
 
         .log-window {
-            background-color: #1e1e1e; border: 1px solid var(--pbs-border);
+            background-color: #121212; border: 1px solid var(--pbs-border);
             font-family: 'Roboto Mono', monospace; font-size: 12px; padding: 15px;
-            color: #d4d4d4; height: 200px; overflow-y: auto; margin-top: 20px;
+            color: #e0e0e0; height: 200px; overflow-y: auto; margin-top: 20px;
             border-radius: 4px; display: none;
         }
         .log-line { margin-bottom: 4px; border-bottom: 1px solid #333; padding-bottom: 2px; }
         .log-success { color: #4caf50; font-weight: bold; }
-        .log-error { color: #f44336; font-weight: bold; }
+        .log-error { color: #ff6b6b; font-weight: bold; }
         .log-info { color: #64b5f6; }
-
+        
+        /* MODAL DARK THEME OVERRIDES */
+        .modal-content {
+            background-color: var(--pbs-modal-bg);
+            border: 1px solid var(--pbs-border);
+            color: var(--pbs-text-main);
+        }
+        .modal-header, .modal-footer {
+            border-color: var(--pbs-border);
+        }
+        .list-group-item {
+            background-color: transparent;
+            color: var(--pbs-text-main);
+            border-color: var(--pbs-border);
+        }
+        .list-group-item:hover {
+            background-color: var(--pbs-input-disabled);
+        }
     </style>
 </head>
 <body>
@@ -279,7 +332,9 @@
                                 <span class="input-group-text" style="background-color: var(--pbs-bg-body); border-color: var(--pbs-border); color: var(--pbs-text-main);"><i class="bi bi-folder-plus"></i></span>
                                 <input type="text" id="targetFolder" class="form-control" placeholder="e.g. Backups/LinuxVMs">
                             </div>
-                            <div class="form-text opacity-75" style="font-size: 0.8em;">Leave empty to upload to root.</div>
+                            <div class="form-hint-box">
+                                Leave empty to upload to <b>root</b>.
+                            </div>
                         </div>
                     </div>
 
@@ -289,14 +344,17 @@
                         </div>
 
                         <div class="col-12">
-                            <label class="form-label">Specific Paths to Backup (Comma Separated)</label>
+                            <label class="form-label">Specific Paths to Backup</label>
                             <div class="input-group">
                                 <span class="input-group-text" style="background-color: var(--pbs-bg-body); border-color: var(--pbs-border); color: var(--pbs-text-main);"><i class="bi bi-list-check"></i></span>
                                 <input type="text" id="sourcePaths" class="form-control" placeholder="e.g. home, etc/nginx, var/www">
+                                <button class="btn btn-outline-secondary" type="button" onclick="openExplorer()">
+                                    <i class="bi bi-folder2-open me-1"></i> Browse Files
+                                </button>
                             </div>
-                            <div class="form-text opacity-75" style="font-size: 0.8em;">
-                                Leave empty to backup the <b>entire disk</b>. <br>
-                                Example: To backup <code>/home</code> and <code>/etc</code>, type: <code>home, etc</code>
+                            <div class="form-hint-box">
+                                Leave empty to backup the <b>entire disk</b>.<br>
+                                Use <b>Browse Files</b> to pick folders from the snapshot (Mounts snapshot temporarily).
                             </div>
                         </div>
                     </div>
@@ -315,6 +373,38 @@
             </div>
         </div>
     </div>
+
+    <div class="modal fade" id="explorerModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-hdd-stack me-2"></i>Snapshot Explorer</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-0">
+                    <div class="d-flex align-items-center p-2 border-bottom" style="background-color: var(--pbs-input-disabled);">
+                        <button class="btn btn-sm btn-link text-decoration-none" onclick="explorePath('')">
+                            <i class="bi bi-house-door-fill"></i> Root
+                        </button>
+                        <span class="mx-1 text-muted">/</span>
+                        <span id="currentPathLabel" class="text-muted small">Loading...</span>
+                    </div>
+                    
+                    <div id="explorerList" class="list-group list-group-flush">
+                        <div class="text-center p-4 text-muted">
+                            <div class="spinner-border text-primary mb-2" role="status"></div>
+                            <p>Mounting image & listing files...<br><small>(This may take a few seconds)</small></p>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 
     <script>
         // --- Theme Logic ---
@@ -441,7 +531,6 @@
         async function startBackup() {
             const snapshot = snapshotSelect.value;
             const remote = document.getElementById("remoteSelect").value;
-            // YENİ PARAMETRELERİ AL
             const targetFolder = document.getElementById("targetFolder").value;
             const sourcePaths = document.getElementById("sourcePaths").value;
             
@@ -457,7 +546,6 @@
             let formData = new FormData();
             formData.append("snapshot", snapshot);
             formData.append("remote", remote);
-            // BACKEND'E İLET
             formData.append("target_folder", targetFolder);
             formData.append("source_paths", sourcePaths);
 
@@ -472,6 +560,100 @@
                 }
             } catch (e) { log("Connection Failed.", "error"); }
             setTimeout(() => document.getElementById("startBackupBtn").disabled = false, 3000);
+        }
+
+        // --- EXPLORER LOGIC ---
+        let explorerModal;
+        
+        function openExplorer() {
+            const snapshot = document.getElementById("snapshotSelect").value;
+            if (!snapshot) {
+                log("Please select a snapshot first!", "error");
+                return;
+            }
+            
+            if (!explorerModal) explorerModal = new bootstrap.Modal(document.getElementById('explorerModal'));
+            explorerModal.show();
+            explorePath(""); // Load Root
+        }
+
+        async function explorePath(path) {
+            const snapshot = document.getElementById("snapshotSelect").value;
+            const listContainer = document.getElementById("explorerList");
+            const pathLabel = document.getElementById("currentPathLabel");
+            
+            pathLabel.innerText = path || "/";
+            listContainer.innerHTML = `
+                <div class="text-center p-4 text-muted">
+                    <div class="spinner-border spinner-border-sm text-primary mb-2" role="status"></div>
+                    <p class="mb-0 small">Reading filesystem...</p>
+                </div>`;
+
+            let formData = new FormData();
+            formData.append("snapshot", snapshot);
+            formData.append("path", path);
+
+            try {
+                const res = await fetch("/explore", {method: "POST", body: formData});
+                const data = await res.json();
+
+                if (data.status === "success") {
+                    renderExplorer(data.items);
+                } else {
+                    listContainer.innerHTML = `<div class="p-3 text-danger text-center"><i class="bi bi-exclamation-circle me-1"></i> ${data.message}</div>`;
+                }
+            } catch (e) {
+                listContainer.innerHTML = `<div class="p-3 text-danger text-center">Network Error</div>`;
+            }
+        }
+
+        function renderExplorer(items) {
+            const listContainer = document.getElementById("explorerList");
+            listContainer.innerHTML = "";
+
+            if (items.length === 0) {
+                listContainer.innerHTML = `<div class="p-3 text-muted text-center small">Empty Directory</div>`;
+                return;
+            }
+
+            items.forEach(item => {
+                const isDir = item.type === 'dir';
+                const icon = isDir ? 'bi-folder-fill text-warning' : 'bi-file-earmark-text text-secondary';
+                
+                const itemDiv = document.createElement("div");
+                itemDiv.className = "list-group-item d-flex justify-content-between align-items-center";
+                
+                // Name (Clickable if dir)
+                let nameHtml = "";
+                if (isDir) {
+                    nameHtml = `<a href="#" onclick="explorePath('${item.path}'); return false;" class="text-decoration-none d-flex align-items-center text-truncate" style="color: inherit; max-width: 85%;">
+                                    <i class="bi ${icon} me-2"></i> ${item.name}
+                                </a>`;
+                } else {
+                    nameHtml = `<span class="d-flex align-items-center text-truncate" style="max-width: 85%;">
+                                    <i class="bi ${icon} me-2"></i> ${item.name}
+                                </span>`;
+                }
+
+                // Add Button
+                const addBtn = `<button class="btn btn-sm btn-outline-primary py-0 px-2" onclick="addPathToInput('${item.path}')" title="Add to list">
+                                    <i class="bi bi-plus-lg"></i>
+                                </button>`;
+
+                itemDiv.innerHTML = nameHtml + addBtn;
+                listContainer.appendChild(itemDiv);
+            });
+        }
+
+        function addPathToInput(path) {
+            const input = document.getElementById("sourcePaths");
+            let current = input.value.split(',').map(s => s.trim()).filter(s => s);
+            
+            if (!current.includes(path)) {
+                current.push(path);
+                input.value = current.join(', ');
+                log(`Added path: ${path}`, "success");
+            }
         }
     </script>
 </body>

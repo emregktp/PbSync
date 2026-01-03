@@ -1,6 +1,8 @@
 import os
 import subprocess
 import time
+import json
+import shutil
 
 # --- Constants ---
 DRIVE_NAME = "drive-scsi0.img"
@@ -40,7 +42,7 @@ def get_largest_partition(device_path):
         partitions = []
         for line in result.stdout.strip().split('\n'):
             parts = line.split()
-            # lsblk çıktısında partitionlar genellikle 'loop0p1' gibi görünür
+            # lsblk output usually looks like 'loop0p1'
             if len(parts) == 2 and parts[0].startswith(os.path.basename(device_path) + 'p'):
                 name, size_str = parts
                 partitions.append((f"/dev/{name}", int(size_str)))
@@ -65,6 +67,70 @@ def cleanup():
     run_command(["umount", "-l", MOUNT_POINT], check=False)
     run_command(["proxmox-backup-client", "unmap", LOOP_DEV], check=False)
     print("--- Cleanup Finished ---")
+
+def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
+    """
+    Mounts the snapshot, lists directories in the specified path, and unmounts.
+    Returns a dict with items.
+    """
+    print(f"\n--- Exploring Snapshot: {snapshot} Path: {path} ---")
+    current_env = os.environ.copy()
+    
+    # Ensure clean state
+    cleanup() 
+    run_command(["mkdir", "-p", MOUNT_POINT])
+
+    try:
+        # 1. Map
+        map_cmd = [
+            "proxmox-backup-client", "map", snapshot, DRIVE_NAME,
+            "--repository", config['pbs_repository_path']
+        ]
+        run_command(map_cmd, env=current_env)
+        time.sleep(1) # Wait for device mapping
+
+        # 2. Mount
+        target_partition = get_largest_partition(LOOP_DEV)
+        try:
+            # Try read-only with norecovery (faster/safer for backups)
+            run_command(["mount", "-o", "ro,norecovery", target_partition, MOUNT_POINT])
+        except:
+            # Fallback
+            run_command(["mount", "-o", "ro", target_partition, MOUNT_POINT])
+
+        # 3. List Files
+        # Prevent directory traversal
+        safe_path = os.path.normpath(os.path.join(MOUNT_POINT, path.strip('/')))
+        if not safe_path.startswith(MOUNT_POINT):
+            safe_path = MOUNT_POINT
+
+        if not os.path.exists(safe_path):
+            return {"status": "error", "message": "Path not found inside backup"}
+
+        items = []
+        with os.scandir(safe_path) as entries:
+            for entry in entries:
+                # Get relative path for the API
+                rel_path = os.path.relpath(entry.path, MOUNT_POINT)
+                
+                items.append({
+                    "name": entry.name,
+                    "type": "dir" if entry.is_dir() else "file",
+                    "path": rel_path
+                })
+        
+        # Sort: Directories first, then files (alphabetical)
+        items.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
+        
+        return {"status": "success", "items": items, "current_path": path}
+
+    except Exception as e:
+        print(f"Explore Error: {e}")
+        return {"status": "error", "message": str(e)}
+    
+    finally:
+        # Always cleanup immediately after listing to free resources
+        cleanup()
 
 def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: str = "", source_paths: str = ""):
     """
@@ -98,7 +164,6 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         print(f"\n-> [Step 2/4] Mounting filesystem...")
         target_partition = get_largest_partition(LOOP_DEV)
         
-        # Try read-only mount with dirty-fs protection
         try:
             run_command(["mount", "-o", "ro,norecovery,noload", target_partition, MOUNT_POINT])
         except Exception:
@@ -108,39 +173,34 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         # 4. Stream & Upload
         print(f"\n-> [Step 3/4] Preparing stream pipeline...")
         
-        # Dosya ismi oluştur: vmid_Tarih.tar.gz
+        # File Name: vmid_Date.tar.gz
         vmid = snapshot.split('/')[1]
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         archive_name = f"{vmid}_{timestamp}.tar.gz"
         
-        # Rclone Hedef Yolu (Remote:Klasör/Dosya)
+        # Construct Remote Path
         if target_folder and target_folder.strip():
-            # Baştaki/sondaki slashleri temizle
             clean_folder = target_folder.strip().strip('/')
             full_remote_path = f"{remote}:{clean_folder}/{archive_name}"
         else:
             full_remote_path = f"{remote}:{archive_name}"
 
-        # Mount dizinine gir
+        # Enter Mount Point
         os.chdir(MOUNT_POINT)
         print(f"   Working directory: {os.getcwd()}")
 
-        # Kaynak Dosya Seçimi
+        # Process Source Paths
         if source_paths and source_paths.strip():
-            # Virgülle ayrılmış stringi listeye çevir ve boşlukları temizle
+            # Convert comma-separated string to list
             dirs_to_backup = [p.strip() for p in source_paths.split(',') if p.strip()]
         else:
-            # Boşsa tüm dizini al
+            # Backup everything
             dirs_to_backup = ["."]
 
         print(f"   Backup Source Paths: {dirs_to_backup}")
         print(f"   Upload Target: {full_remote_path}")
 
         # Pipeline: tar -> pigz -> rclone
-        # - tar: Dosyaları paketler (seçilenleri)
-        # - pigz: Hızlıca sıkıştırır
-        # - rclone: Stream olarak yükler
-        
         tar_cmd = ["tar", "cf", "-"] + dirs_to_backup
         pigz_cmd = ["pigz", "-1"]
         rclone_cmd = ["rclone", "rcat", full_remote_path, "-P", "--buffer-size", "128M"]
@@ -151,12 +211,12 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
             p1 = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE, stderr=log_file, env=current_env)
             # P2: Pigz (Reads P1)
             p2 = subprocess.Popen(pigz_cmd, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=log_file, env=current_env)
-            p1.stdout.close() # Allow P1 to receive SIGPIPE if P2 exits
+            p1.stdout.close() 
             # P3: Rclone (Reads P2)
             p3 = subprocess.Popen(rclone_cmd, stdin=p2.stdout, stderr=subprocess.PIPE, text=True, env=current_env)
             p2.stdout.close()
 
-            # Rclone stderr çıktısını (ilerleme durumu) canlı oku ve loga bas
+            # Read Rclone Progress
             for line in iter(p3.stderr.readline, ''):
                 print(f"   [Cloud] {line.strip()}")
             
@@ -174,7 +234,6 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         print(f"{'!'*60}")
     
     finally:
-        # Ana dizine dön ve temizlik yap
         if os.getcwd() != base_dir:
             os.chdir(base_dir)
         cleanup()

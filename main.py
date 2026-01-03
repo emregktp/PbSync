@@ -6,7 +6,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 import uvicorn
-from core import run_backup_process
+from core import run_backup_process, list_files_in_snapshot
 
 # --- AYARLAR ---
 CONFIG_DIR = "/app/data"
@@ -18,7 +18,6 @@ templates = Jinja2Templates(directory="templates")
 
 # --- KONFIGURASYON YÖNETİMİ ---
 def get_config():
-    # Dosya yoksa None dön (Setup'a yönlendirir)
     if not os.path.exists(CONFIG_FILE):
         return None
     
@@ -29,17 +28,15 @@ def get_config():
         print(f"CONFIG LOAD ERROR: {e}")
         return None
 
-    # Rclone config yolunu göster
+    # Environment Variables
     os.environ['RCLONE_CONFIG'] = RCLONE_CONFIG_PATH
     
-    # PBS Ayarlarını Al
     pbs_user = config.get('pbs_user', 'root@pam')
     pbs_host = config.get('pbs_host', 'localhost')
     pbs_repo = config.get('pbs_repo', 'backup')
     pbs_pass = config.get('pbs_password', '')
     pbs_fingerprint = config.get('pbs_fingerprint', '')
 
-    # Environment Set Et
     os.environ['PBS_PASSWORD'] = pbs_pass
     if pbs_fingerprint and pbs_fingerprint.strip():
         os.environ['PBS_FINGERPRINT'] = pbs_fingerprint.strip()
@@ -81,7 +78,6 @@ async def handle_setup_form(
             f.write(rclone_conf.strip())
         os.chmod(RCLONE_CONFIG_PATH, 0o600)
 
-        # Başarılı olunca Ana Sayfaya yönlendir (303: See Other)
         return RedirectResponse(url="/", status_code=303)
         
     except Exception as e:
@@ -117,7 +113,7 @@ async def check_status(config: dict = Depends(get_config)):
     
     response = {}
     
-    # PBS Kontrolü
+    # PBS Check
     try:
         subprocess.run(
             f"proxmox-backup-client snapshot list --repository {os.environ['PBS_REPOSITORY']} --output-format json-pretty", 
@@ -131,7 +127,7 @@ async def check_status(config: dict = Depends(get_config)):
     except Exception as e:
         response["pbs"] = {"status": False, "msg": str(e)}
 
-    # Rclone Kontrolü
+    # Rclone Check
     try:
         subprocess.run("rclone listremotes", shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=os.environ)
         response["rclone"] = {"status": True, "msg": "Ready"}
@@ -179,21 +175,32 @@ async def scan_snapshots(vmid: str = Form(...), config: dict = Depends(get_confi
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# --- START STREAM (GÜNCELLENDİ) ---
+# --- FILE EXPLORER (YENİ) ---
+@app.post("/explore")
+async def explore_snapshot(
+    snapshot: str = Form(...), 
+    path: str = Form(""), 
+    config: dict = Depends(get_config)
+):
+    if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
+    
+    # Calls core function to mount/list/unmount
+    result = list_files_in_snapshot(config, snapshot, path)
+    return result
+
+# --- START STREAM ---
 @app.post("/start-stream")
 async def start_stream(
     background_tasks: BackgroundTasks, 
     snapshot: str = Form(...), 
     remote: str = Form(...),
-    target_folder: str = Form(""), # YENİ: Opsiyonel
-    source_paths: str = Form(""),  # YENİ: Opsiyonel
+    target_folder: str = Form(""),
+    source_paths: str = Form(""), 
     config: dict = Depends(get_config)
 ):
     if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
     
-    # Yeni parametreleri core'a iletiyoruz
     background_tasks.add_task(run_backup_process, config, snapshot, remote, target_folder, source_paths)
-    
     return {"status": "started", "message": f"Stream Started: {snapshot} -> {remote}"}
 
 if __name__ == "__main__":
