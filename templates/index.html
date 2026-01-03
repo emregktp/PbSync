@@ -60,30 +60,32 @@
             transition: all 0.3s;
         }
 
-        /* --- CUSTOM DROPDOWN STYLE --- */
+        /* --- DROPDOWN FIX --- */
         .custom-dropdown {
-            position: relative;
-            width: 100%;
+            position: relative !important; /* Make parent relative */
         }
         .dropdown-list {
             position: absolute;
             top: 100%;
             left: 0;
-            right: 0;
+            width: 100%; /* Match parent width */
             background-color: var(--pbs-dropdown-bg);
             border: 1px solid var(--pbs-border);
             border-top: none;
-            max-height: 200px;
+            max-height: 250px;
             overflow-y: auto;
-            z-index: 1000;
+            z-index: 1050;
             display: none;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            box-shadow: 0 6px 12px rgba(0,0,0,0.2);
+            border-radius: 0 0 4px 4px;
         }
         .dropdown-item {
-            padding: 8px 12px;
+            padding: 10px 12px;
             cursor: pointer;
             color: var(--pbs-text-main);
+            border-bottom: 1px solid var(--pbs-border);
         }
+        .dropdown-item:last-child { border-bottom: none; }
         .dropdown-item:hover {
             background-color: var(--pbs-dropdown-hover);
         }
@@ -457,7 +459,7 @@
         const globalError = document.getElementById("globalError");
         const globalErrorText = document.getElementById("globalErrorText");
 
-        let allVMs = []; // Store VMs here
+        let allVMs = [];
 
         document.addEventListener('DOMContentLoaded', () => {
             checkStatus();
@@ -465,16 +467,16 @@
         });
 
         // --- CUSTOM DROPDOWN LOGIC ---
-        vmInput.addEventListener('focus', () => vmList.style.display = 'block');
+        vmInput.addEventListener('focus', () => {
+            if (vmList.innerHTML.trim() !== "") vmList.style.display = 'block';
+        });
         
-        // Hide dropdown when clicking outside
         document.addEventListener('click', (e) => {
             if (!vmInput.contains(e.target) && !vmList.contains(e.target)) {
                 vmList.style.display = 'none';
             }
         });
 
-        // Filter functionality
         vmInput.addEventListener('input', () => {
             const filter = vmInput.value.toUpperCase();
             const items = vmList.getElementsByClassName("dropdown-item");
@@ -488,10 +490,6 @@
                 } else {
                     items[i].style.display = "none";
                 }
-            }
-            
-            if (!hasVisible && filter.length > 0) {
-                // If no match, show manual entry suggestion (optional)
             }
             vmList.style.display = 'block';
         });
@@ -553,50 +551,7 @@
             }
         }
 
-        // --- (Diğer JS fonksiyonları aynen kalıyor...) ---
-        
-        async function checkStatus() {
-            try {
-                const res = await fetch("/check-status");
-                const status = await res.json();
-                updateBadge('pbsStatus', status.pbs);
-                updateBadge('rcloneStatus', status.rclone);
-                if (!status.pbs.status || !status.rclone.status) {
-                    let msg = "";
-                    if (!status.pbs.status) msg += `[PBS] ${status.pbs.msg} `;
-                    if (!status.rclone.status) msg += `[Cloud] ${status.rclone.msg}`;
-                    showGlobalError(msg);
-                } else {
-                    globalError.style.display = 'none';
-                }
-            } catch(e) {
-                console.error("Status check failed", e);
-                showGlobalError("Frontend could not reach Backend API.");
-            }
-        }
-
-        function updateBadge(id, statusObj) {
-            const badge = document.getElementById(id);
-            badge.className = 'status-badge ' + (statusObj.status ? 'status-online' : 'status-offline');
-            badge.title = statusObj.msg;
-        }
-
-        function showGlobalError(msg) {
-            globalError.style.display = 'block';
-            globalErrorText.innerText = msg;
-        }
-
-        function log(msg, type = 'info') {
-            logWindow.style.display = 'block';
-            const line = document.createElement('div');
-            line.className = 'log-line';
-            const time = new Date().toLocaleTimeString('en-US', { hour12: false });
-            let colorClass = type === 'error' ? 'log-error' : (type === 'success' ? 'log-success' : 'log-info');
-            line.innerHTML = `<span class="text-muted small">[${time}]</span> <span class="${colorClass}">${msg}</span>`;
-            logWindow.appendChild(line);
-            logWindow.scrollTop = logWindow.scrollHeight;
-        }
-
+        // ... (Diğer fonksiyonlar: startBackup, openExplorer, vb. AYNI KALIYOR) ...
         async function startBackup() {
             const snapshot = snapshotSelect.value;
             const remote = document.getElementById("remoteSelect").value;
@@ -720,6 +675,37 @@
                 input.value = current.join(', ');
                 log(`Added path: ${path}`, "success");
             }
+        }
+        
+        async function checkStatus() {
+            try {
+                const res = await fetch("/check-status");
+                const status = await res.json();
+                updateBadge('pbsStatus', status.pbs);
+                updateBadge('rcloneStatus', status.rclone);
+                if (!status.pbs.status || !status.rclone.status) {
+                    let msg = "";
+                    if (!status.pbs.status) msg += `[PBS] ${status.pbs.msg} `;
+                    if (!status.rclone.status) msg += `[Cloud] ${status.rclone.msg}`;
+                    showGlobalError(msg);
+                } else {
+                    globalError.style.display = 'none';
+                }
+            } catch(e) {
+                console.error("Status check failed", e);
+                showGlobalError("Frontend could not reach Backend API.");
+            }
+        }
+
+        function updateBadge(id, statusObj) {
+            const badge = document.getElementById(id);
+            badge.className = 'status-badge ' + (statusObj.status ? 'status-online' : 'status-offline');
+            badge.title = statusObj.msg;
+        }
+
+        function showGlobalError(msg) {
+            globalError.style.display = 'block';
+            globalErrorText.innerText = msg;
         }
     </script>
 </body>
