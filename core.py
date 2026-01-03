@@ -30,24 +30,34 @@ def run_command(command, shell=False, check=True, env=None):
 
 def find_active_loop_device():
     """
-    Finds the loop device associated with our backup mapping.
+    Finds the loop device associated with our backup mapping using standard text parsing.
+    Fallback to the most recently created loop device if specific mapping isn't found.
     """
     try:
-        # List all loop devices and look for our image name
-        res = run_command(["losetup", "-a", "-J"], check=False)
-        data = json.loads(res.stdout)
+        # 1. Try to find via backing file name (losetup -a output format: /dev/loopX: [major:minor] (inode) /path/to/file)
+        res = run_command(["losetup", "-a"], check=False)
+        output = res.stdout.strip()
         
-        for dev in data.get('loopdevices', []):
-            if DRIVE_NAME in dev.get('back-file', ''):
-                return dev['name']
-        
-        # Fallback: look for the most recently created loop device
+        # PBS mapping often shows up as the repository string or the image name
+        for line in output.splitlines():
+            # Example: /dev/loop0: [0034]:12345 (/run/proxmox-backup/...)
+            if DRIVE_NAME in line or "proxmox" in line:
+                return line.split(":")[0].strip()
+
+        # 2. Fallback: Find the loop device with the highest number (most likely the new one)
         loop_devs = glob.glob("/dev/loop*")
-        # Filter only numeric ones (loop0, loop1...)
-        loop_devs = [d for d in loop_devs if d[9:].isdigit()]
-        if loop_devs:
-            loop_devs.sort(key=lambda x: int(x.replace("/dev/loop", "")))
-            return loop_devs[-1]
+        # Filter for strictly numeric loop devices (e.g., loop0, loop1, not loop-control)
+        numeric_loops = []
+        for dev in loop_devs:
+            # Check if it ends with a digit
+            if dev[9:].isdigit():
+                numeric_loops.append(dev)
+        
+        if numeric_loops:
+            # Sort by the integer value of the suffix
+            numeric_loops.sort(key=lambda x: int(x.replace("/dev/loop", "")))
+            # Return the last one (highest number)
+            return numeric_loops[-1]
             
     except Exception as e:
         print(f"Loop finding error: {e}")
@@ -101,17 +111,20 @@ def get_mount_candidates(loop_dev):
         candidates = walk(data.get('blockdevices', []))
     except: pass
 
-    # 2. Fallback to glob if lsblk failed
+    # 2. Fallback to glob if lsblk failed or returned nothing
     if not candidates:
         base = os.path.basename(loop_dev)
+        # Look for mapper partitions created by kpartx
         candidates.extend(glob.glob(f"/dev/mapper/{base}p*"))
+        # Also add the raw device
         candidates.append(loop_dev)
 
     # Dedup and prioritize
     candidates = list(dict.fromkeys(candidates))
+    # Move raw loop device to the end of the list to prioritize partitions
     if loop_dev in candidates and len(candidates) > 1:
         candidates.remove(loop_dev)
-        candidates.append(loop_dev) # Try raw device last
+        candidates.append(loop_dev)
 
     print(f"-> Candidates: {candidates}")
     return candidates
