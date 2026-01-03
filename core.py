@@ -2,88 +2,180 @@ import os
 import subprocess
 import time
 
-# Docker içinde bu pathler sabittir
-MOUNT_POINT = "/mnt/pbsync_restore"
+# --- Constants ---
 DRIVE_NAME = "drive-scsi0.img"
 LOOP_DEV = "/dev/loop0"
-LOG_FILE = "/app/data/pbsync.log"
+MOUNT_POINT = "/mnt/pbsync_restore"
+LOG_FILE_PATH = "/app/data/pbsync_stream.log"
 
-def run_command(cmd, shell=False, env=None):
-    """Komut çalıştırır ve loglar."""
-    process_env = os.environ.copy()
-    if env: process_env.update(env)
-    
-    print(f"CMD: {cmd}")
+def run_command(command, shell=False, check=True, env=None):
+    """
+    Runs a command and logs its output.
+    """
+    print(f"COMMAND: {' '.join(command) if isinstance(command, list) else command}")
     try:
-        return subprocess.run(cmd, shell=shell, check=True, capture_output=True, text=True, env=process_env)
+        process_env = os.environ.copy()
+        if env: process_env.update(env)
+
+        result = subprocess.run(
+            command, shell=shell, check=check, capture_output=True, text=True, env=process_env
+        )
+        if result.stdout: print(f"STDOUT: {result.stdout.strip()}")
+        if result.stderr: print(f"STDERR: {result.stderr.strip()}")
+        return result
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: {e.stderr}")
-        raise e
+        print(f"ERROR: Command failed. Return Code: {e.returncode}")
+        print(f"STDOUT: {e.stdout}")
+        print(f"STDERR: {e.stderr}")
+        raise
+
+def get_largest_partition(device_path):
+    """
+    Finds the largest partition within a given block device.
+    """
+    print(f"-> Searching for the largest partition in '{device_path}'...")
+    try:
+        cmd = ["lsblk", "-nr", "-o", "NAME,SIZE", "-b", device_path]
+        result = run_command(cmd)
+        partitions = []
+        for line in result.stdout.strip().split('\n'):
+            parts = line.split()
+            # lsblk çıktısında partitionlar genellikle 'loop0p1' gibi görünür
+            if len(parts) == 2 and parts[0].startswith(os.path.basename(device_path) + 'p'):
+                name, size_str = parts
+                partitions.append((f"/dev/{name}", int(size_str)))
+
+        if not partitions:
+            print("-> No partitions found, using the main device.")
+            return device_path
+            
+        largest_part = sorted(partitions, key=lambda x: x[1], reverse=True)[0]
+        print(f"-> Largest partition found: {largest_part[0]} (Size: {largest_part[1]} bytes)")
+        return largest_part[0]
+
+    except Exception as e:
+        print(f"WARNING: Partition check failed: {e}. Defaulting to raw device.")
+        return device_path
 
 def cleanup():
-    """Mount ve map işlemlerini temizler."""
-    print("-> Temizlik yapılıyor...")
-    subprocess.run(["umount", "-l", MOUNT_POINT], stderr=subprocess.DEVNULL)
-    subprocess.run(["proxmox-backup-client", "unmap", LOOP_DEV], stderr=subprocess.DEVNULL)
+    """
+    Cleans up all mounts and maps.
+    """
+    print("--- Starting Cleanup ---")
+    run_command(["umount", "-l", MOUNT_POINT], check=False)
+    run_command(["proxmox-backup-client", "unmap", LOOP_DEV], check=False)
+    print("--- Cleanup Finished ---")
 
-def get_largest_partition():
-    """Loop device içindeki en büyük partition'ı bulur."""
-    try:
-        cmd = f"lsblk -nr -o NAME,SIZE -b {LOOP_DEV} | grep 'loop0p' | sort -rn -k2 | head -n1 | cut -d' ' -f1"
-        part = subprocess.check_output(cmd, shell=True).decode().strip()
-        return f"/dev/{part}" if part else LOOP_DEV
-    except:
-        return LOOP_DEV
+def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: str = "", source_paths: str = ""):
+    """
+    Main backup logic with Folder & Path selection support.
+    """
+    print(f"\n{'='*60}\nSTARTING NEW STREAM PROCESS\n{'='*60}")
+    print(f"Time: {time.ctime()}")
+    print(f"Source Snapshot: {snapshot}")
+    print(f"Target Remote: {remote}")
+    print(f"Target Folder: {target_folder if target_folder else '(Root)'}")
+    print(f"Source Paths: {source_paths if source_paths else '(Full Disk)'}\n")
 
-def run_backup_process(snapshot: str, remote: str):
-    """Arka plan yedekleme süreci."""
-    with open(LOG_FILE, "a") as log:
-        log.write(f"\n--- NEW JOB: {snapshot} -> {remote} ({time.ctime()}) ---\n")
-    
-    repo = os.environ.get('PBS_REPOSITORY')
-    
+    current_env = os.environ.copy()
+    base_dir = current_env.get("PWD", "/")
+
     try:
-        cleanup()
-        os.makedirs(MOUNT_POINT, exist_ok=True)
+        # 1. Prepare
+        run_command(["mkdir", "-p", MOUNT_POINT])
+        cleanup() # Ensure clean state
+
+        # 2. Map Snapshot
+        print(f"\n-> [Step 1/4] Mapping snapshot...")
+        map_cmd = [
+            "proxmox-backup-client", "map", snapshot, DRIVE_NAME,
+            "--repository", config['pbs_repository_path']
+        ]
+        run_command(map_cmd, env=current_env)
+        time.sleep(2) # Wait for device to settle
+
+        # 3. Mount Filesystem
+        print(f"\n-> [Step 2/4] Mounting filesystem...")
+        target_partition = get_largest_partition(LOOP_DEV)
         
-        # 1. Map
-        print(f"Mapping {snapshot}...")
-        run_command(["proxmox-backup-client", "map", snapshot, DRIVE_NAME, "--repository", repo])
-        
-        # 2. Mount
-        target_part = get_largest_partition()
-        print(f"Mounting {target_part}...")
-        
-        # Dirty FS hatasını önlemek için norecovery
+        # Try read-only mount with dirty-fs protection
         try:
-            run_command(["mount", "-o", "ro,norecovery,noload", target_part, MOUNT_POINT])
-        except:
-            # Fallback
-            run_command(["mount", "-o", "ro", target_part, MOUNT_POINT])
-            
-        # 3. Stream
+            run_command(["mount", "-o", "ro,norecovery,noload", target_partition, MOUNT_POINT])
+        except Exception:
+            print("-> Standard mount failed, trying fallback options...")
+            run_command(["mount", "-o", "ro", target_partition, MOUNT_POINT])
+
+        # 4. Stream & Upload
+        print(f"\n-> [Step 3/4] Preparing stream pipeline...")
+        
+        # Dosya ismi oluştur: vmid_Tarih.tar.gz
         vmid = snapshot.split('/')[1]
-        archive_name = f"{vmid}_{time.strftime('%Y%m%d_%H%M')}.tar.gz"
-        remote_path = f"{remote}:{archive_name}"
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        archive_name = f"{vmid}_{timestamp}.tar.gz"
         
-        print("Streaming started...")
+        # Rclone Hedef Yolu (Remote:Klasör/Dosya)
+        if target_folder and target_folder.strip():
+            # Baştaki/sondaki slashleri temizle
+            clean_folder = target_folder.strip().strip('/')
+            full_remote_path = f"{remote}:{clean_folder}/{archive_name}"
+        else:
+            full_remote_path = f"{remote}:{archive_name}"
+
+        # Mount dizinine gir
+        os.chdir(MOUNT_POINT)
+        print(f"   Working directory: {os.getcwd()}")
+
+        # Kaynak Dosya Seçimi
+        if source_paths and source_paths.strip():
+            # Virgülle ayrılmış stringi listeye çevir ve boşlukları temizle
+            dirs_to_backup = [p.strip() for p in source_paths.split(',') if p.strip()]
+        else:
+            # Boşsa tüm dizini al
+            dirs_to_backup = ["."]
+
+        print(f"   Backup Source Paths: {dirs_to_backup}")
+        print(f"   Upload Target: {full_remote_path}")
+
+        # Pipeline: tar -> pigz -> rclone
+        # - tar: Dosyaları paketler (seçilenleri)
+        # - pigz: Hızlıca sıkıştırır
+        # - rclone: Stream olarak yükler
         
-        # Pipe komutu: tar -> pigz -> rclone
-        # Shell=True kullanarak pipe işlemini tek satırda hallediyoruz (Daha stabil)
-        stream_cmd = (
-            f"cd {MOUNT_POINT} && "
-            f"tar cf - var etc home root opt 2>> {LOG_FILE} | "
-            f"pigz -1 -p 4 | "
-            f"rclone rcat {remote_path} -P --buffer-size 128M >> {LOG_FILE} 2>&1"
-        )
-        
-        subprocess.run(stream_cmd, shell=True, check=True, executable='/bin/bash')
-        
-        print("SUCCESS.")
-        
+        tar_cmd = ["tar", "cf", "-"] + dirs_to_backup
+        pigz_cmd = ["pigz", "-1"]
+        rclone_cmd = ["rclone", "rcat", full_remote_path, "-P", "--buffer-size", "128M"]
+
+        print("\n-> [Step 4/4] Streaming data...")
+        with open(LOG_FILE_PATH, 'a') as log_file:
+            # P1: Tar
+            p1 = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE, stderr=log_file, env=current_env)
+            # P2: Pigz (Reads P1)
+            p2 = subprocess.Popen(pigz_cmd, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=log_file, env=current_env)
+            p1.stdout.close() # Allow P1 to receive SIGPIPE if P2 exits
+            # P3: Rclone (Reads P2)
+            p3 = subprocess.Popen(rclone_cmd, stdin=p2.stdout, stderr=subprocess.PIPE, text=True, env=current_env)
+            p2.stdout.close()
+
+            # Rclone stderr çıktısını (ilerleme durumu) canlı oku ve loga bas
+            for line in iter(p3.stderr.readline, ''):
+                print(f"   [Cloud] {line.strip()}")
+            
+            p3.wait()
+
+        if p1.wait() != 0: raise Exception("TAR failed. Check if paths exist.")
+        if p2.wait() != 0: raise Exception("PIGZ compression failed.")
+        if p3.returncode != 0: raise Exception("RCLONE upload failed.")
+
+        print(f"\n-> SUCCESS! Backup successfully uploaded to {full_remote_path}")
+
     except Exception as e:
-        print(f"FAILURE: {e}")
-        with open(LOG_FILE, "a") as log:
-            log.write(f"CRITICAL ERROR: {e}\n")
+        print(f"\n{'!'*20} CRITICAL ERROR {'!'*20}")
+        print(f"{e}")
+        print(f"{'!'*60}")
+    
     finally:
+        # Ana dizine dön ve temizlik yap
+        if os.getcwd() != base_dir:
+            os.chdir(base_dir)
         cleanup()
+        print(f"\n{'='*60}\nPROCESS FINISHED\n{'='*60}\n")

@@ -154,6 +154,12 @@
         .btn-pbs:hover { background-color: #2c7bb6; }
         .btn-pbs:disabled { background-color: #777; cursor: not-allowed; }
 
+        .btn-refresh {
+            background-color: transparent; border: 1px solid var(--pbs-border);
+            color: var(--pbs-text-main); padding: 9px 12px; border-radius: 3px; cursor: pointer;
+        }
+        .btn-refresh:hover { background-color: var(--pbs-hover); }
+
         .log-window {
             background-color: #1e1e1e; border: 1px solid var(--pbs-border);
             font-family: 'Roboto Mono', monospace; font-size: 12px; padding: 15px;
@@ -228,7 +234,7 @@
                                     <option value="" selected disabled>Select a VM...</option>
                                     <option value="manual">-- Enter Manually --</option>
                                 </select>
-                                <button class="btn btn-outline-secondary" type="button" onclick="scanVMs()" title="Refresh VM List">
+                                <button class="btn-refresh" type="button" onclick="scanVMs()" title="Refresh VM List">
                                     <i class="bi bi-arrow-clockwise"></i>
                                 </button>
                             </div>
@@ -251,7 +257,7 @@
                             <h6 class="text-uppercase small fw-bold opacity-75 border-bottom pb-2" style="border-color: var(--pbs-border) !important;">2. Target Configuration</h6>
                         </div>
 
-                        <div class="col-12">
+                        <div class="col-md-6">
                             <label class="form-label">Target Remote (Rclone)</label>
                             <div class="input-group">
                                 <span class="input-group-text" style="background-color: var(--pbs-bg-body); border-color: var(--pbs-border); color: var(--pbs-text-main);"><i class="bi bi-cloud-check-fill"></i></span>
@@ -264,6 +270,33 @@
                                         <option value="" disabled selected>{{ remotes[0] or "No rclone remotes found." }}</option>
                                     {% endif %}
                                 </select>
+                            </div>
+                        </div>
+
+                        <div class="col-md-6">
+                            <label class="form-label">Target Folder (Optional)</label>
+                            <div class="input-group">
+                                <span class="input-group-text" style="background-color: var(--pbs-bg-body); border-color: var(--pbs-border); color: var(--pbs-text-main);"><i class="bi bi-folder-plus"></i></span>
+                                <input type="text" id="targetFolder" class="form-control" placeholder="e.g. Backups/LinuxVMs">
+                            </div>
+                            <div class="form-text opacity-75" style="font-size: 0.8em;">Leave empty to upload to root.</div>
+                        </div>
+                    </div>
+
+                    <div class="row g-4 mb-4">
+                        <div class="col-12">
+                            <h6 class="text-uppercase small fw-bold opacity-75 border-bottom pb-2" style="border-color: var(--pbs-border) !important;">3. Advanced Options</h6>
+                        </div>
+
+                        <div class="col-12">
+                            <label class="form-label">Specific Paths to Backup (Comma Separated)</label>
+                            <div class="input-group">
+                                <span class="input-group-text" style="background-color: var(--pbs-bg-body); border-color: var(--pbs-border); color: var(--pbs-text-main);"><i class="bi bi-list-check"></i></span>
+                                <input type="text" id="sourcePaths" class="form-control" placeholder="e.g. home, etc/nginx, var/www">
+                            </div>
+                            <div class="form-text opacity-75" style="font-size: 0.8em;">
+                                Leave empty to backup the <b>entire disk</b>. <br>
+                                Example: To backup <code>/home</code> and <code>/etc</code>, type: <code>home, etc</code>
                             </div>
                         </div>
                     </div>
@@ -322,7 +355,6 @@
                 updateBadge('pbsStatus', status.pbs);
                 updateBadge('rcloneStatus', status.rclone);
 
-                // Show global error if connections fail
                 if (!status.pbs.status || !status.rclone.status) {
                     let msg = "";
                     if (!status.pbs.status) msg += `[PBS] ${status.pbs.msg} `;
@@ -341,7 +373,7 @@
         function updateBadge(id, statusObj) {
             const badge = document.getElementById(id);
             badge.className = 'status-badge ' + (statusObj.status ? 'status-online' : 'status-offline');
-            badge.title = statusObj.msg; // Tooltip shows the error
+            badge.title = statusObj.msg;
         }
 
         function showGlobalError(msg) {
@@ -409,15 +441,26 @@
         async function startBackup() {
             const snapshot = snapshotSelect.value;
             const remote = document.getElementById("remoteSelect").value;
+            // YENİ PARAMETRELERİ AL
+            const targetFolder = document.getElementById("targetFolder").value;
+            const sourcePaths = document.getElementById("sourcePaths").value;
+            
             if (!snapshot || snapshotSelect.disabled) {
                 log("Please select a snapshot first.", "error");
                 return;
             }
             log(`Starting stream: ${snapshot} -> ${remote}`, "info");
+            if(targetFolder) log(`Target Folder: ${targetFolder}`, "info");
+            
             document.getElementById("startBackupBtn").disabled = true;
+            
             let formData = new FormData();
             formData.append("snapshot", snapshot);
             formData.append("remote", remote);
+            // BACKEND'E İLET
+            formData.append("target_folder", targetFolder);
+            formData.append("source_paths", sourcePaths);
+
             try {
                 const res = await fetch("/start-stream", {method: "POST", body: formData});
                 const data = await res.json();

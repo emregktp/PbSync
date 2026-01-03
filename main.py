@@ -18,6 +18,7 @@ templates = Jinja2Templates(directory="templates")
 
 # --- KONFIGURASYON YÖNETİMİ ---
 def get_config():
+    # Dosya yoksa None dön (Setup'a yönlendirir)
     if not os.path.exists(CONFIG_FILE):
         return None
     
@@ -26,21 +27,20 @@ def get_config():
             config = json.load(f)
     except Exception as e:
         print(f"CONFIG LOAD ERROR: {e}")
-        # Hata durumunda boş dön ki setup'a yönlendirsin
         return None
 
-    # Environment Variable'ları set et
+    # Rclone config yolunu göster
     os.environ['RCLONE_CONFIG'] = RCLONE_CONFIG_PATH
     
+    # PBS Ayarlarını Al
     pbs_user = config.get('pbs_user', 'root@pam')
     pbs_host = config.get('pbs_host', 'localhost')
     pbs_repo = config.get('pbs_repo', 'backup')
     pbs_pass = config.get('pbs_password', '')
-    pbs_fingerprint = config.get('pbs_fingerprint', '') # Yeni eklenen alan
+    pbs_fingerprint = config.get('pbs_fingerprint', '')
 
+    # Environment Set Et
     os.environ['PBS_PASSWORD'] = pbs_pass
-    
-    # Fingerprint varsa environment'a ekle (SSL hatasını çözer)
     if pbs_fingerprint and pbs_fingerprint.strip():
         os.environ['PBS_FINGERPRINT'] = pbs_fingerprint.strip()
     
@@ -61,7 +61,7 @@ async def handle_setup_form(
     pbs_repo: str = Form(...),
     pbs_user: str = Form(...),
     pbs_password: str = Form(...),
-    pbs_fingerprint: str = Form(None), # Opsiyonel yeni alan
+    pbs_fingerprint: str = Form(None),
     rclone_conf: str = Form(...)
 ):
     try:
@@ -81,6 +81,7 @@ async def handle_setup_form(
             f.write(rclone_conf.strip())
         os.chmod(RCLONE_CONFIG_PATH, 0o600)
 
+        # Başarılı olunca Ana Sayfaya yönlendir (303: See Other)
         return RedirectResponse(url="/", status_code=303)
         
     except Exception as e:
@@ -116,7 +117,7 @@ async def check_status(config: dict = Depends(get_config)):
     
     response = {}
     
-    # 1. PBS Kontrolü
+    # PBS Kontrolü
     try:
         subprocess.run(
             f"proxmox-backup-client snapshot list --repository {os.environ['PBS_REPOSITORY']} --output-format json-pretty", 
@@ -125,14 +126,12 @@ async def check_status(config: dict = Depends(get_config)):
         response["pbs"] = {"status": True, "msg": "Connected"}
     except subprocess.CalledProcessError as e:
         err_msg = e.stderr.decode().strip() or "Connection Failed"
-        # SSL Hatasını yakala ve kullanıcı dostu mesaj ver
-        if "fingerprint" in err_msg.lower():
-            err_msg = "SSL Error: Fingerprint mismatch or missing!"
+        if "fingerprint" in err_msg.lower(): err_msg = "SSL Error: Fingerprint mismatch!"
         response["pbs"] = {"status": False, "msg": err_msg}
     except Exception as e:
         response["pbs"] = {"status": False, "msg": str(e)}
 
-    # 2. Rclone Kontrolü
+    # Rclone Kontrolü
     try:
         subprocess.run("rclone listremotes", shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=os.environ)
         response["rclone"] = {"status": True, "msg": "Ready"}
@@ -143,7 +142,7 @@ async def check_status(config: dict = Depends(get_config)):
         
     return response
 
-# --- VM SCAN ---
+# --- VM & SNAPSHOT SCAN ---
 @app.post("/scan-vms")
 async def scan_vms(config: dict = Depends(get_config)):
     if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
@@ -159,11 +158,9 @@ async def scan_vms(config: dict = Depends(get_config)):
                 vms.add(f"{item['backup-type']}/{item['backup-id']}")
         
         sorted_vms = sorted(list(vms))
-        if not sorted_vms: return {"status": "error", "message": "No backups found in repository."}
+        if not sorted_vms: return {"status": "error", "message": "No backups found."}
         return {"status": "success", "vms": sorted_vms}
         
-    except subprocess.CalledProcessError as e:
-        return {"status": "error", "message": f"PBS Error: {e.output.decode() if e.output else 'Check Logs'}"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -182,15 +179,21 @@ async def scan_snapshots(vmid: str = Form(...), config: dict = Depends(get_confi
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+# --- START STREAM (GÜNCELLENDİ) ---
 @app.post("/start-stream")
 async def start_stream(
     background_tasks: BackgroundTasks, 
     snapshot: str = Form(...), 
     remote: str = Form(...),
+    target_folder: str = Form(""), # YENİ: Opsiyonel
+    source_paths: str = Form(""),  # YENİ: Opsiyonel
     config: dict = Depends(get_config)
 ):
     if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
-    background_tasks.add_task(run_backup_process, config, snapshot, remote)
+    
+    # Yeni parametreleri core'a iletiyoruz
+    background_tasks.add_task(run_backup_process, config, snapshot, remote, target_folder, source_paths)
+    
     return {"status": "started", "message": f"Stream Started: {snapshot} -> {remote}"}
 
 if __name__ == "__main__":
