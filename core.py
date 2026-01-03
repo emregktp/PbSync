@@ -28,14 +28,14 @@ def run_command(command, shell=False, check=True, env=None):
         print(f"ERROR: Command failed. Return Code: {e.returncode}")
         print(f"STDOUT: {e.stdout}")
         print(f"STDERR: {e.stderr}")
-        raise # Hata fırlat ki üst katman yakalasın
+        raise # Hata fırlat
 
 def cleanup():
     print("--- Starting Cleanup ---")
     # 1. Unmount
     run_command(["umount", "-l", MOUNT_POINT], check=False)
     
-    # 2. Deactivate LVM (Önemli: LVM kilitlerini kaldırır)
+    # 2. Deactivate LVM
     run_command(["vgchange", "-an"], check=False)
     
     # 3. Clean up partition mappings
@@ -61,7 +61,6 @@ def detect_and_mount():
     except: pass
     
     # B. LVM Yapılarını Tanıt (Linux VM'ler için kritik)
-    # vgscan: Volume Groupları bul, vgchange -ay: Hepsini aktif et
     try:
         run_command(["vgscan", "--mknodes"], check=False)
         run_command(["vgchange", "-ay"], check=False)
@@ -70,16 +69,16 @@ def detect_and_mount():
     time.sleep(2) # Kernel'in cihazları oluşturmasını bekle
 
     # C. Mount Edilebilir Dosya Sistemlerini Bul
-    # lsblk ile sadece FSTYPE'ı olan (yani mount edilebilen) cihazları listele
-    # Çıktı formatı: NAME FSTYPE SIZE
-    cmd = ["lsblk", "-r", "-n", "-o", "NAME,FSTYPE,SIZE"]
+    # KRİTİK DÜZELTME: Sadece MAIN_LOOP_DEV içindeki cihazları listele
+    # Ana disk (sda) karışmasın diye parametre eklendi.
+    cmd = ["lsblk", "-r", "-n", "-o", "NAME,FSTYPE,SIZE", MAIN_LOOP_DEV]
     result = run_command(cmd)
     
     candidates = []
     
     for line in result.stdout.splitlines():
         parts = line.split()
-        if len(parts) < 2: continue # FSTYPE yoksa atla (örn: ham partition, swap)
+        if len(parts) < 2: continue # FSTYPE yoksa atla
         
         name = parts[0]
         fstype = parts[1]
@@ -96,13 +95,13 @@ def detect_and_mount():
         if os.path.exists(f"/dev/mapper/{name}"):
             dev_path = f"/dev/mapper/{name}"
             
-        # Loop cihazının kendisini (iso9660 değilse) hariç tutmaya gerek yok, 
-        # bazen direkt formatlı olabilir. Ama genelde partition arıyoruz.
-        
         candidates.append({"path": dev_path, "fstype": fstype, "size": size})
 
     if not candidates:
-        raise Exception("No mountable filesystems (ext4/xfs/ntfs) detected! Disk might be encrypted or raw.")
+        # Aday bulunamadıysa loglara daha detaylı bilgi bas
+        print("DEBUG: lsblk output was:")
+        print(result.stdout)
+        raise Exception(f"No mountable filesystems (ext4/xfs/ntfs) detected inside {MAIN_LOOP_DEV}! Disk might be encrypted or raw.")
 
     # En büyüğünü seç (Genellikle data partition'ıdır)
     target = sorted(candidates, key=lambda x: x["size"], reverse=True)[0]
