@@ -4,11 +4,9 @@ import time
 import shutil
 import glob
 import json
-import re
 
 # --- Constants ---
-# Sadece dosya adı referansı, fiziksel path değil.
-DRIVE_NAME = "drive-scsi0.img" 
+DRIVE_NAME = "drive-scsi0.img"
 MOUNT_POINT = "/mnt/pbsync_restore"
 LOG_FILE_PATH = "/app/data/pbsync_stream.log"
 
@@ -24,151 +22,125 @@ def run_command(command, shell=False, check=True, env=None):
         )
         if result.stdout and not "lsblk" in cmd_str: 
             print(f"STDOUT: {result.stdout.strip()[:200]}...")
-        if result.stderr: 
-            print(f"STDERR: {result.stderr.strip()}")
         return result
     except subprocess.CalledProcessError as e:
         print(f"ERROR: Command failed. Return Code: {e.returncode}")
-        print(f"STDOUT: {e.stdout}")
-        print(f"STDERR: {e.stderr}")
-        raise
+        print(f"STDERR: {e.stderr.strip()}")
+        raise e
 
-def find_mapped_loop_device():
+def find_active_loop_device():
     """
-    PBS tarafından oluşturulan loop cihazını bulur.
-    proxmox-backup-client map işlemi arka planda bir loop cihazı oluşturur.
-    Bunu losetup ile tarayarak bulacağız.
+    Finds the loop device associated with our backup mapping.
     """
     try:
-        # losetup -a tüm loop cihazlarını listeler.
-        # PBS map işlemi genellikle dosya yolunda 'proxmox-backup' veya repository adını içerir.
-        res = run_command(["losetup", "-a"], check=False)
-        output = res.stdout.strip()
+        # List all loop devices and look for our image name
+        res = run_command(["losetup", "-a", "-J"], check=False)
+        data = json.loads(res.stdout)
         
-        # En son oluşturulan loop cihazını bulmaya çalışalım veya backup ismine göre filtreleyelim.
-        # Genellikle PBS client map ettiğinde backing file olarak garip bir FUSE path'i görünür.
+        for dev in data.get('loopdevices', []):
+            if DRIVE_NAME in dev.get('back-file', ''):
+                return dev['name']
         
-        # En basit yöntem: En son loop cihazını kontrol etmektir ama riskli.
-        # Daha güvenli: lsblk ile 'loop' tipindeki ve boyutu 0 olmayan cihazları alıp,
-        # map işleminden hemen sonra hangisinin belirdiğine bakmak.
-        
-        # Ancak PBS Client map komutu nereye map ettiğini çıktı olarak vermez.
-        # Bu yüzden sistemdeki tüm loop cihazlarını tarayıp partitions/LVM arayacağız.
-        
-        # Alternatif: Map işlemi /dev/loopX oluşturur. 
-        # Biz map öncesi ve sonrası loop listesini karşılaştırabiliriz ama bu stateless olmaz.
-        
-        # Şimdilik en son (highest number) loop cihazını aday olarak alalım.
+        # Fallback: look for the most recently created loop device
         loop_devs = glob.glob("/dev/loop*")
-        # Sadece sayı ile bitenleri al (loop-control vb hariç)
+        # Filter only numeric ones (loop0, loop1...)
         loop_devs = [d for d in loop_devs if d[9:].isdigit()]
-        
-        if not loop_devs: return None
-        
-        # Sort by number
-        loop_devs.sort(key=lambda x: int(x.replace("/dev/loop", "")))
-        
-        # En sonuncuyu döndür (Genellikle yeni map edilen sondadır)
-        # Ama emin olmak için 'losetup' çıktısında 'drive-scsi0' arayabiliriz.
-        for line in output.splitlines():
-            if DRIVE_NAME in line or "pbs" in line.lower() or "backup" in line.lower():
-                # /dev/loopX: [0034]:...
-                return line.split(":")[0].strip()
-                
-        # Bulamazsak en sonuncuyu deneyelim
-        return loop_devs[-1]
-
+        if loop_devs:
+            loop_devs.sort(key=lambda x: int(x.replace("/dev/loop", "")))
+            return loop_devs[-1]
+            
     except Exception as e:
-        print(f"Loop detection error: {e}")
-        return None
+        print(f"Loop finding error: {e}")
+    return None
 
-def cleanup_loop(loop_dev):
-    if not loop_dev: return
-    print(f"--- Cleaning up {loop_dev} ---")
+def cleanup_loop(loop_dev=None):
+    print("--- Starting Cleanup ---")
     try: run_command(["umount", "-l", MOUNT_POINT], check=False)
     except: pass
+    
+    if loop_dev:
+        try: run_command(["kpartx", "-d", loop_dev], check=False)
+        except: pass
+        
     try: run_command(["vgchange", "-an"], check=False)
-    except: pass
-    try: run_command(["kpartx", "-d", loop_dev], check=False)
     except: pass
     try: run_command(["dmsetup", "remove_all"], check=False)
     except: pass
-    # Unmap işlemi spesifik loop dev üzerinden değil repository üzerinden yapılır ama
-    # burada manuel map yaptığımız için unmap'i client üzerinden çağırmalıyız.
-    # Ancak client unmap komutu 'name' ister (drive-scsi0.img).
+    
+    # Unmap via client
     try: run_command(["proxmox-backup-client", "unmap", DRIVE_NAME], check=False)
     except: pass
+    print("--- Cleanup Finished ---")
 
 def get_mount_candidates(loop_dev):
     print(f"-> Analyzing partitions on {loop_dev}...")
     candidates = []
 
-    # 1. lsblk ile JSON al
+    # 1. Try lsblk JSON first
     try:
         cmd = ["lsblk", "-b", "-J", "-o", "NAME,SIZE,TYPE,FSTYPE,PKNAME", loop_dev]
         res = run_command(cmd)
         data = json.loads(res.stdout)
         
-        def extract_candidates(devices):
+        def walk(devices):
             found = []
-            for dev in devices:
-                name = dev.get('name')
-                full_path = ""
+            for d in devices:
+                # Construct path
+                path = f"/dev/{d['name']}"
+                if os.path.exists(f"/dev/mapper/{d['name']}"):
+                    path = f"/dev/mapper/{d['name']}"
                 
-                if os.path.exists(f"/dev/mapper/{name}"): full_path = f"/dev/mapper/{name}"
-                elif os.path.exists(f"/dev/{name}"): full_path = f"/dev/{name}"
+                # We want partitions, LVMs, or the raw disk itself if it has a filesystem
+                if d.get('fstype') or d.get('type') in ['part', 'lvm', 'loop']:
+                    found.append(path)
                 
-                if full_path: found.append(full_path)
-                if 'children' in dev: found.extend(extract_candidates(dev['children']))
+                if 'children' in d:
+                    found.extend(walk(d['children']))
             return found
 
-        candidates = extract_candidates(data.get('blockdevices', []))
+        candidates = walk(data.get('blockdevices', []))
     except: pass
-    
-    # 2. Fallback Glob (loopXp1, loopXp2...)
-    if not candidates and loop_dev:
-        # /dev/loop0 -> /dev/mapper/loop0p*
-        base_name = os.path.basename(loop_dev) # loop0
-        mappers = glob.glob(f"/dev/mapper/{base_name}p*")
-        candidates.extend(mappers)
 
-    # 3. Raw Device
-    if not candidates and loop_dev:
-        print(f"-> No partitions found. Using raw device {loop_dev}.")
-        candidates = [loop_dev]
-    
-    # Ana cihazı sona at
+    # 2. Fallback to glob if lsblk failed
+    if not candidates:
+        base = os.path.basename(loop_dev)
+        candidates.extend(glob.glob(f"/dev/mapper/{base}p*"))
+        candidates.append(loop_dev)
+
+    # Dedup and prioritize
+    candidates = list(dict.fromkeys(candidates))
     if loop_dev in candidates and len(candidates) > 1:
         candidates.remove(loop_dev)
-        candidates.append(loop_dev)
+        candidates.append(loop_dev) # Try raw device last
 
     print(f"-> Candidates: {candidates}")
     return candidates
 
-def try_mount(device_path):
-    print(f"-> Trying to mount: {device_path}")
+def try_mount_device(device):
+    print(f"-> Attempting to mount: {device}")
     if not os.path.exists(MOUNT_POINT): os.makedirs(MOUNT_POINT)
-
-    strategies = [
-        ["mount", "-o", "ro", device_path, MOUNT_POINT], 
-        ["mount", "-t", "xfs", "-o", "ro,norecovery", device_path, MOUNT_POINT],
-        ["ntfs-3g", "-o", "ro,remove_hiberfile", device_path, MOUNT_POINT],
-        ["mount", "-t", "ext4", "-o", "ro", device_path, MOUNT_POINT]
+    
+    # Try different filesystems
+    cmds = [
+        ["mount", "-o", "ro", device, MOUNT_POINT],
+        ["mount", "-t", "xfs", "-o", "ro,norecovery", device, MOUNT_POINT],
+        ["ntfs-3g", "-o", "ro,remove_hiberfile", device, MOUNT_POINT],
+        ["mount", "-t", "ext4", "-o", "ro", device, MOUNT_POINT]
     ]
-
-    for cmd in strategies:
+    
+    for cmd in cmds:
         try:
             run_command(cmd)
-            print(f"   SUCCESS! Mounted {device_path}")
+            print(f"   SUCCESS! Mounted with: {cmd}")
             return True
         except: continue
     return False
 
 def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
-    print(f"\n--- Exploring Snapshot: {snapshot} ---")
+    print(f"\n--- Exploring: {snapshot} ---")
     current_env = os.environ.copy()
     
-    # Ön temizlik (Genel)
+    # Force cleanup before starting
     try: run_command(["proxmox-backup-client", "unmap", DRIVE_NAME], check=False)
     except: pass
     
@@ -177,53 +149,53 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
     active_loop = None
 
     try:
-        # 1. Map (Doğru komut: map <snap> <name>)
-        # Loop device argümanı VERMİYORUZ. Sistem atıyor.
+        # 1. Map
         map_cmd = [
             "proxmox-backup-client", "map", snapshot, DRIVE_NAME,
             "--repository", config['pbs_repository_path']
         ]
+        
         try:
             run_command(map_cmd, env=current_env)
         except subprocess.CalledProcessError as e:
-            return {"status": "error", "message": f"Mapping Failed: {e}. Check Docker privileges."}
+            return {"status": "error", "message": f"Map Failed (OS Error 95?). Check Docker AppArmor settings. Log: {e.stderr}"}
 
-        time.sleep(1) # Cihazın oluşmasını bekle
+        # Give it a moment to settle
+        time.sleep(2)
 
-        # 2. Hangi loop cihazı atandı bul
-        active_loop = find_mapped_loop_device()
+        # 2. Identify Loop Device
+        active_loop = find_active_loop_device()
         if not active_loop:
-            return {"status": "error", "message": "Map successful but could not identify loop device."}
+            return {"status": "error", "message": "Map command finished but no loop device found."}
         
-        print(f"-> Identified Active Loop Device: {active_loop}")
+        print(f"-> Mapped to: {active_loop}")
 
-        # 3. Activate
+        # 3. Scan Partitions
         try: run_command(["kpartx", "-a", "-v", "-s", active_loop])
         except: pass
         try: 
             run_command(["vgscan", "--mknodes"], check=False)
             run_command(["vgchange", "-ay"], check=False)
         except: pass
-        time.sleep(1)
+        time.sleep(2)
 
         # 4. Mount
         candidates = get_mount_candidates(active_loop)
         mounted = False
         for dev in candidates:
-            if try_mount(dev):
+            if try_mount_device(dev):
                 mounted = True
                 break
         
         if not mounted:
-            cleanup_loop(active_loop)
-            return {"status": "error", "message": "Could not mount partition. Encrypted or unsupported filesystem."}
+            return {"status": "error", "message": "Could not mount any partition. Unsupported filesystem or encrypted disk."}
 
         # 5. List Files
         safe_path = os.path.normpath(os.path.join(MOUNT_POINT, path.strip('/')))
         if not safe_path.startswith(MOUNT_POINT): safe_path = MOUNT_POINT
 
         if not os.path.exists(safe_path):
-            return {"status": "error", "message": "Path not found inside backup"}
+            return {"status": "error", "message": "Path not found"}
 
         items = []
         with os.scandir(safe_path) as entries:
@@ -238,27 +210,24 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
         return {"status": "success", "items": items, "current_path": path}
 
     except Exception as e:
-        print(f"Explore Error: {e}")
+        print(f"Global Error: {e}")
         return {"status": "error", "message": str(e)}
     finally:
-        if active_loop: cleanup_loop(active_loop)
+        cleanup_loop(active_loop)
 
 def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: str = "", source_paths: str = ""):
-    print(f"\n{'='*60}\nSTARTING NEW STREAM PROCESS\n{'='*60}")
-    print(f"Source: {snapshot}")
-    
+    print(f"\n--- Starting Stream: {snapshot} ---")
     current_env = os.environ.copy()
-    base_dir = current_env.get("PWD", "/")
     active_loop = None
 
     try:
-        # Temizlik
+        # Cleanup
         try: run_command(["proxmox-backup-client", "unmap", DRIVE_NAME], check=False)
         except: pass
         run_command(["mkdir", "-p", MOUNT_POINT])
 
         # 1. Map
-        print(f"\n-> Mapping snapshot...")
+        print("-> Mapping...")
         map_cmd = [
             "proxmox-backup-client", "map", snapshot, DRIVE_NAME,
             "--repository", config['pbs_repository_path']
@@ -266,31 +235,30 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         run_command(map_cmd, env=current_env)
         time.sleep(2)
 
-        # 2. Find Loop
-        active_loop = find_mapped_loop_device()
-        if not active_loop:
-            raise Exception("Could not find mapped loop device.")
-        print(f"-> Mapped to: {active_loop}")
+        # 2. Identify
+        active_loop = find_active_loop_device()
+        if not active_loop: raise Exception("Loop device not found after mapping.")
+        print(f"-> Active Loop: {active_loop}")
 
         # 3. Activate
-        print("-> Activating partitions/LVM...")
+        print("-> Activating partitions...")
         try: run_command(["kpartx", "-a", "-v", "-s", active_loop])
         except: pass
         try: 
             run_command(["vgscan", "--mknodes"], check=False)
             run_command(["vgchange", "-ay"], check=False)
         except: pass
-        time.sleep(1)
+        time.sleep(2)
 
         # 4. Mount
         candidates = get_mount_candidates(active_loop)
         mounted = False
         for dev in candidates:
-            if try_mount(dev):
+            if try_mount_device(dev):
                 mounted = True
                 break
         
-        if not mounted: raise Exception("Failed to mount filesystem.")
+        if not mounted: raise Exception("Mount failed for all candidates.")
 
         # 5. Stream
         vmid = snapshot.split('/')[1]
@@ -298,37 +266,37 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         archive_name = f"{vmid}_{timestamp}.tar.gz"
         
         full_remote_path = f"{remote}:{archive_name}"
-        if target_folder and target_folder.strip():
+        if target_folder.strip():
             full_remote_path = f"{remote}:{target_folder.strip().strip('/')}/{archive_name}"
 
         os.chdir(MOUNT_POINT)
         
-        dirs_to_backup = ["."]
-        if source_paths and source_paths.strip():
-            dirs_to_backup = [p.strip() for p in source_paths.split(',') if p.strip()]
+        dirs = ["."]
+        if source_paths.strip():
+            dirs = [p.strip() for p in source_paths.split(',') if p.strip()]
 
-        tar_cmd = ["tar", "cf", "-"] + dirs_to_backup
+        tar_cmd = ["tar", "cf", "-"] + dirs
         pigz_cmd = ["pigz", "-1"]
         rclone_cmd = ["rclone", "rcat", full_remote_path, "-P", "--buffer-size", "128M"]
 
-        print("\n-> Streaming data...")
+        print("-> Streaming...")
         with open(LOG_FILE_PATH, 'a') as log_file:
             p1 = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE, stderr=log_file, env=current_env)
             p2 = subprocess.Popen(pigz_cmd, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=log_file, env=current_env)
-            p1.stdout.close() 
+            p1.stdout.close()
             p3 = subprocess.Popen(rclone_cmd, stdin=p2.stdout, stderr=subprocess.PIPE, text=True, env=current_env)
             p2.stdout.close()
-
+            
+            # Read rclone progress
             for line in iter(p3.stderr.readline, ''):
                 print(f"   [Cloud] {line.strip()}")
             
             p3.wait()
 
-        if p3.returncode != 0: raise Exception("Upload failed.")
-        print(f"\n-> SUCCESS! Backup uploaded to {full_remote_path}")
+        if p3.returncode != 0: raise Exception("Rclone upload failed.")
+        print("-> SUCCESS: Stream complete.")
 
     except Exception as e:
-        print(f"\nCRITICAL ERROR: {e}")
+        print(f"CRITICAL ERROR: {e}")
     finally:
-        if os.getcwd() != base_dir: os.chdir(base_dir)
-        if active_loop: cleanup_loop(active_loop)
+        cleanup_loop(active_loop)
