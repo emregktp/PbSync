@@ -62,21 +62,21 @@
 
         /* --- DROPDOWN FIX --- */
         .custom-dropdown {
-            position: relative !important; /* Make parent relative */
+            position: relative;
         }
         .dropdown-list {
             position: absolute;
             top: 100%;
             left: 0;
-            width: 100%; /* Match parent width */
+            width: 100%;
             background-color: var(--pbs-dropdown-bg);
             border: 1px solid var(--pbs-border);
             border-top: none;
             max-height: 250px;
             overflow-y: auto;
-            z-index: 1050;
+            z-index: 9999; /* En üstte */
             display: none;
-            box-shadow: 0 6px 12px rgba(0,0,0,0.2);
+            box-shadow: 0 6px 12px rgba(0,0,0,0.3);
             border-radius: 0 0 4px 4px;
         }
         .dropdown-item {
@@ -225,6 +225,7 @@
         }
         .btn-refresh:hover { background-color: var(--pbs-hover); }
 
+        /* --- LOG WINDOW (FIXED VISIBILITY) --- */
         .log-window {
             background-color: #1a1a1a; 
             border: 1px solid var(--pbs-border);
@@ -236,7 +237,7 @@
             overflow-y: auto; 
             margin-top: 20px;
             border-radius: 4px; 
-            display: none;
+            display: block; /* VARSAYILAN OLARAK GÖRÜNÜR YAPILDI */
         }
         [data-theme="dark"] .log-window .text-muted { color: #bbbbbb !important; }
         .log-line { margin-bottom: 4px; border-bottom: 1px solid #333; padding-bottom: 2px; }
@@ -551,7 +552,6 @@
             }
         }
 
-        // ... (Diğer fonksiyonlar: startBackup, openExplorer, vb. AYNI KALIYOR) ...
         async function startBackup() {
             const snapshot = snapshotSelect.value;
             const remote = document.getElementById("remoteSelect").value;
@@ -675,37 +675,6 @@
                 input.value = current.join(', ');
                 log(`Added path: ${path}`, "success");
             }
-        }
-        
-        async function checkStatus() {
-            try {
-                const res = await fetch("/check-status");
-                const status = await res.json();
-                updateBadge('pbsStatus', status.pbs);
-                updateBadge('rcloneStatus', status.rclone);
-                if (!status.pbs.status || !status.rclone.status) {
-                    let msg = "";
-                    if (!status.pbs.status) msg += `[PBS] ${status.pbs.msg} `;
-                    if (!status.rclone.status) msg += `[Cloud] ${status.rclone.msg}`;
-                    showGlobalError(msg);
-                } else {
-                    globalError.style.display = 'none';
-                }
-            } catch(e) {
-                console.error("Status check failed", e);
-                showGlobalError("Frontend could not reach Backend API.");
-            }
-        }
-
-        function updateBadge(id, statusObj) {
-            const badge = document.getElementById(id);
-            badge.className = 'status-badge ' + (statusObj.status ? 'status-online' : 'status-offline');
-            badge.title = statusObj.msg;
-        }
-
-        function showGlobalError(msg) {
-            globalError.style.display = 'block';
-            globalErrorText.innerText = msg;
         }
     </script>
 </body>

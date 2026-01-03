@@ -3,6 +3,7 @@ import subprocess
 import time
 import shutil
 import glob
+import json
 
 # --- Constants ---
 DRIVE_NAME = "drive-scsi0.img"
@@ -40,81 +41,103 @@ def cleanup():
     run_command(["proxmox-backup-client", "unmap", MAIN_LOOP_DEV], check=False)
     print("--- Cleanup Finished ---")
 
-def get_device_size(device_path):
+def debug_disk_structure():
     """
-    Returns the size of a block device in bytes using blockdev.
+    Mount hatası alındığında disk yapısını loglara basar.
     """
+    print("\n" + "!"*30 + " DEBUG INFO " + "!"*30)
+    print("-> Listing Block Devices (lsblk):")
+    run_command(["lsblk", "-a", "-o", "NAME,SIZE,TYPE,FSTYPE"], check=False)
+    print("\n-> Listing Mappers (/dev/mapper):")
+    run_command("ls -l /dev/mapper", shell=True, check=False)
+    print("!"*72 + "\n")
+
+def get_mount_candidates():
+    """
+    Mount edilebilecek tüm adayları bulur.
+    """
+    print(f"-> Analyzing mount candidates...")
+    candidates = []
+
+    # 1. lsblk ile JSON al
     try:
-        res = run_command(["blockdev", "--getsize64", device_path])
-        return int(res.stdout.strip())
-    except:
-        return 0
+        res = run_command(["lsblk", "-J", "-b", "-o", "NAME,SIZE,TYPE,FSTYPE"], check=False)
+        data = json.loads(res.stdout)
+        
+        def extract_devices(dev_list):
+            found = []
+            for d in dev_list:
+                # Loop0 veya altındakiler
+                full_path = ""
+                name = d.get('name')
+                
+                # Path belirle
+                if os.path.exists(f"/dev/mapper/{name}"):
+                    full_path = f"/dev/mapper/{name}"
+                elif os.path.exists(f"/dev/{name}"):
+                    full_path = f"/dev/{name}"
+                
+                if full_path:
+                    # Sadece partition, lvm veya loop ana cihazı al
+                    if d.get('type') in ['part', 'lvm', 'loop', 'rom']:
+                        found.append({
+                            'path': full_path,
+                            'size': int(d.get('size', 0)),
+                            'fstype': d.get('fstype')
+                        })
+                
+                if 'children' in d:
+                    found.extend(extract_devices(d['children']))
+            return found
 
-def find_all_candidates():
-    """
-    Finds ALL potential mount candidates by scanning /dev/mapper and /dev/loop*
-    Sorts them by size (Largest first).
-    This bypasses lsblk tree complexity and finds LVMs directly.
-    """
-    candidates = set()
+        candidates = extract_devices(data.get('blockdevices', []))
+
+    except Exception as e:
+        print(f"lsblk parsing failed: {e}. Falling back to glob.")
+        # Fallback: Glob
+        for path in glob.glob("/dev/mapper/*") + glob.glob("/dev/loop0*"):
+            if "control" not in path:
+                try:
+                    size = int(subprocess.check_output(["blockdev", "--getsize64", path]).strip())
+                    candidates.append({'path': path, 'size': size, 'fstype': None})
+                except: pass
+
+    # Boyuta göre sırala (En büyük en üstte)
+    candidates.sort(key=lambda x: x['size'], reverse=True)
     
-    # 1. Always include the raw device (for raw filesystems)
-    candidates.add(MAIN_LOOP_DEV)
-
-    # 2. Find all mapper devices (LVM Volumes + kpartx partitions)
-    # They usually live in /dev/mapper/
-    mappers = glob.glob("/dev/mapper/*")
-    for dev in mappers:
-        if "control" not in dev: # Skip control device
-            candidates.add(dev)
-
-    # 3. Find standard partitions if created (loop0p1 etc)
-    partitions = glob.glob("/dev/loop0p*")
-    for dev in partitions:
-        candidates.add(dev)
-
-    # Convert to list of tuples (path, size)
-    candidate_list = []
-    for dev in candidates:
-        size = get_device_size(dev)
-        if size > 0:
-            candidate_list.append((dev, size))
+    # Sadece path listesi döndür
+    paths = [c['path'] for c in candidates]
     
-    # Sort: Largest first
-    candidate_list.sort(key=lambda x: x[1], reverse=True)
-    
-    # Return just paths
-    sorted_paths = [x[0] for x in candidate_list]
-    print(f"-> Mount candidates (sorted by size): {sorted_paths}")
-    return sorted_paths
+    # Ana disk loop0'ı en sona at (Partition varsa önce onu denesin)
+    if MAIN_LOOP_DEV in paths and len(paths) > 1:
+        paths.remove(MAIN_LOOP_DEV)
+        paths.append(MAIN_LOOP_DEV)
+
+    print(f"-> Candidates: {paths}")
+    return paths
 
 def try_mount(device_path):
-    """
-    Attempts to mount a specific device using multiple filesystem types.
-    """
     print(f"-> Trying to mount: {device_path}")
     if not os.path.exists(MOUNT_POINT): os.makedirs(MOUNT_POINT)
 
-    # Strategies ordered by likelihood
     strategies = [
-        ["mount", "-o", "ro", device_path, MOUNT_POINT], # Auto-detect
-        ["mount", "-t", "xfs", "-o", "ro,norecovery", device_path, MOUNT_POINT], # XFS (Linux)
-        ["ntfs-3g", "-o", "ro,remove_hiberfile", device_path, MOUNT_POINT], # NTFS (Windows)
+        ["mount", "-o", "ro", device_path, MOUNT_POINT], # Auto
+        ["mount", "-t", "xfs", "-o", "ro,norecovery", device_path, MOUNT_POINT], # XFS
+        ["ntfs-3g", "-o", "ro,remove_hiberfile", device_path, MOUNT_POINT], # NTFS
         ["mount", "-t", "ext4", "-o", "ro", device_path, MOUNT_POINT] # EXT4
     ]
 
     for cmd in strategies:
         try:
             run_command(cmd)
-            print(f"   SUCCESS! Mounted {device_path} using: {' '.join(cmd)}")
+            print(f"   SUCCESS! Mounted {device_path}")
             return True
         except:
             continue
-            
     return False
 
 def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
-    print(f"\n--- Exploring Snapshot: {snapshot} Path: {path} ---")
+    print(f"\n--- Exploring Snapshot: {snapshot} ---")
     current_env = os.environ.copy()
     cleanup() 
     run_command(["mkdir", "-p", MOUNT_POINT])
@@ -128,29 +151,26 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
         run_command(map_cmd, env=current_env)
         time.sleep(2)
 
-        # 2. Activate Everything (Partition Table + LVM)
+        # 2. Activate
         try: run_command(["kpartx", "-a", "-v", "-s", MAIN_LOOP_DEV])
         except: pass
-        
         try: 
-            # Critical for LVM detection
             run_command(["vgscan", "--mknodes"], check=False)
             run_command(["vgchange", "-ay"], check=False)
         except: pass
-        
-        time.sleep(1)
+        time.sleep(2)
 
-        # 3. Find & Mount (Brute Force Strategy)
-        candidates = find_all_candidates()
+        # 3. Mount
+        candidates = get_mount_candidates()
         mounted = False
-        
         for dev in candidates:
             if try_mount(dev):
                 mounted = True
                 break
         
         if not mounted:
-            return {"status": "error", "message": "Could not mount any partition/volume in backup."}
+            debug_disk_structure() # Hata detayını loga bas
+            return {"status": "error", "message": "Could not mount any partition/volume. Check server logs."}
 
         # 4. List Files
         safe_path = os.path.normpath(os.path.join(MOUNT_POINT, path.strip('/')))
@@ -205,10 +225,10 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
             run_command(["vgscan", "--mknodes"], check=False)
             run_command(["vgchange", "-ay"], check=False)
         except: pass
-        time.sleep(1)
+        time.sleep(2)
 
-        # 3. Mount (Brute Force)
-        candidates = find_all_candidates()
+        # 3. Mount
+        candidates = get_mount_candidates()
         mounted = False
         for dev in candidates:
             if try_mount(dev):
@@ -216,6 +236,7 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
                 break
         
         if not mounted:
+            debug_disk_structure()
             raise Exception("Failed to mount any filesystem from the snapshot.")
 
         # 4. Stream
