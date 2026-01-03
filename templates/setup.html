@@ -35,6 +35,16 @@
             --pbs-hint-bg: #2a2a2a;
         }
 
+        /* --- PLACEHOLDER FIX FOR DARK MODE --- */
+        .form-control::placeholder {
+            color: #6c757d;
+            opacity: 0.7;
+        }
+        [data-theme="dark"] .form-control::placeholder {
+            color: rgba(255, 255, 255, 0.5) !important; /* Daha parlak */
+            opacity: 1;
+        }
+
         body {
             background-color: var(--pbs-bg-body);
             color: var(--pbs-text-main);
@@ -99,7 +109,6 @@
             box-shadow: none;
         }
         
-        /* Hint Text Fix */
         .form-hint {
             font-size: 0.85em;
             color: var(--pbs-text-muted);

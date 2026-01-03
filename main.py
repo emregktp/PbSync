@@ -24,19 +24,29 @@ def get_config():
         with open(CONFIG_FILE, 'r') as f:
             config = json.load(f)
         
+        # --- LOGGING ---
+        # Hata durumunda docker loglarında görmek için
+        # print(f"DEBUG: Config Loaded: {config}") 
+
         # Environment Variable'ları set et
         os.environ['RCLONE_CONFIG'] = RCLONE_CONFIG_PATH
-        os.environ['PBS_PASSWORD'] = config.get("pbs_password", "")
         
-        # Repository stringini oluştur (user@realm@host:datastore)
-        # Eğer kullanıcı zaten tam format girdiyse bozmayalım, ama genelde user@realm ayrıdır.
-        # Basitlik için config'deki hazır path'i kullanıyoruz.
-        repo = f"{config['pbs_user']}@{config['pbs_host']}:{config['pbs_repo']}"
+        # Güvenli Veri Okuma (Eksik anahtar varsa patlamasın)
+        pbs_user = config.get('pbs_user', 'root@pam')
+        pbs_host = config.get('pbs_host', 'localhost')
+        pbs_repo = config.get('pbs_repo', 'backup')
+        pbs_pass = config.get('pbs_password', '')
+
+        os.environ['PBS_PASSWORD'] = pbs_pass
+        
+        # Repository stringini oluştur
+        repo = f"{pbs_user}@{pbs_host}:{pbs_repo}"
         os.environ['PBS_REPOSITORY'] = repo
         config['pbs_repository_path'] = repo # Template için
         
         return config
-    except:
+    except Exception as e:
+        print(f"CRITICAL CONFIG ERROR: {e}")
         return None
 
 # --- SETUP SAYFALARI ---
@@ -57,18 +67,19 @@ async def handle_setup_form(
         os.makedirs(CONFIG_DIR, exist_ok=True)
         
         config_data = {
-            "pbs_host": pbs_host,
-            "pbs_repo": pbs_repo,
-            "pbs_user": pbs_user,
-            "pbs_password": pbs_password
+            "pbs_host": pbs_host.strip(),
+            "pbs_repo": pbs_repo.strip(),
+            "pbs_user": pbs_user.strip(),
+            "pbs_password": pbs_password.strip()
         }
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config_data, f, indent=4)
 
         with open(RCLONE_CONFIG_PATH, 'w') as f:
-            f.write(rclone_conf)
+            f.write(rclone_conf.strip())
         os.chmod(RCLONE_CONFIG_PATH, 0o600)
 
+        # Başarılı olduğunda Template render ediyoruz
         return templates.TemplateResponse("setup.html", {
             "request": request, 
             "success_message": "Configuration Saved Successfully! Redirecting...",
@@ -85,7 +96,6 @@ async def read_root(request: Request, config: dict = Depends(get_config)):
 
     rclone_remotes = []
     try:
-        # Rclone remote listesini al
         remotes_raw = subprocess.check_output("rclone listremotes", shell=True, env=os.environ).decode().strip()
         rclone_remotes = [line.strip() for line in remotes_raw.split('\n') if line]
     except Exception as e:
@@ -97,61 +107,46 @@ async def read_root(request: Request, config: dict = Depends(get_config)):
         "config": config
     })
 
-# --- DURUM KONTROLÜ (YENİ) ---
+# --- DURUM KONTROLÜ ---
 @app.get("/check-status")
 async def check_status(config: dict = Depends(get_config)):
     if not config: return {"pbs": False, "rclone": False}
     
     status = {"pbs": False, "rclone": False}
-    
-    # 1. PBS Kontrolü (Hızlıca versiyon sorarak veya snapshot listesi isteyerek)
     try:
-        # Repository bağlantısını test etmek için basit bir komut
         subprocess.run(
             f"proxmox-backup-client snapshot list --repository {os.environ['PBS_REPOSITORY']} --output-format json-pretty", 
             shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=os.environ
         )
         status["pbs"] = True
-    except:
-        status["pbs"] = False
+    except: status["pbs"] = False
         
-    # 2. Rclone Kontrolü
     try:
         subprocess.run("rclone listremotes", shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=os.environ)
         status["rclone"] = True
-    except:
-        status["rclone"] = False
+    except: status["rclone"] = False
         
     return status
 
-# --- VM TARAMA (GÜNCELLENDİ: JSON FORMATI) ---
+# --- VM & SNAPSHOT SCAN ---
 @app.post("/scan-vms")
 async def scan_vms(config: dict = Depends(get_config)):
     if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
     
-    # JSON çıktısı alarak parsing hatasını önlüyoruz
     cmd = f"proxmox-backup-client snapshot list --repository {os.environ['PBS_REPOSITORY']} --output-format json-pretty"
-    
     try:
         output = subprocess.check_output(cmd, shell=True, env=os.environ).decode().strip()
         data = json.loads(output)
         
         vms = set()
         for item in data:
-            # item['backup-id'] -> "100"
-            # item['backup-type'] -> "vm" veya "ct"
             if 'backup-type' in item and 'backup-id' in item:
-                # Format: vm/100
                 vms.add(f"{item['backup-type']}/{item['backup-id']}")
         
         sorted_vms = sorted(list(vms))
-        if not sorted_vms: return {"status": "error", "message": "No VMs found (List is empty)."}
+        if not sorted_vms: return {"status": "error", "message": "No VMs found in repository."}
         return {"status": "success", "vms": sorted_vms}
         
-    except subprocess.CalledProcessError as e:
-        return {"status": "error", "message": f"PBS Connection Failed: {e}"}
-    except json.JSONDecodeError:
-        return {"status": "error", "message": "Invalid JSON response from PBS Client."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -159,45 +154,15 @@ async def scan_vms(config: dict = Depends(get_config)):
 async def scan_snapshots(vmid: str = Form(...), config: dict = Depends(get_config)):
     if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
     
-    # JSON ile snapshotları çek
-    cmd = f"proxmox-backup-client snapshot list --repository {os.environ['PBS_REPOSITORY']} --output-format json-pretty"
+    # Basit ve güvenli liste alma (grep ile)
+    filter_str = vmid if "/" in vmid else f"vm/{vmid}"
+    cmd = f"proxmox-backup-client snapshot list --repository {os.environ['PBS_REPOSITORY']} | grep '{filter_str}' | awk '{{print $2}}' | sort -r"
+    
     try:
-        output = subprocess.check_output(cmd, shell=True, env=os.environ).decode().strip()
-        data = json.loads(output)
-        
-        snapshots = []
-        # vmid formatı "vm/100" veya sadece "100" olabilir.
-        target_id = vmid.split('/')[-1] # "100"
-        target_type = vmid.split('/')[0] if '/' in vmid else None # "vm"
-        
-        for item in data:
-            if str(item.get('backup-id')) == target_id:
-                if target_type and item.get('backup-type') != target_type:
-                    continue
-                # Snapshot path oluştur: vm/100/2023-01-01T12:00:00Z
-                snap_path = f"{item['backup-type']}/{item['backup-id']}/{item['backup-time-string']}" if 'backup-time-string' in item else None
-                # Alternatif: PBS bazen backup-time epoch döner, json çıktısına göre değişebilir.
-                # json-pretty çıktısında genelde "backup-time" (epoch) olur.
-                # Biz listeleme komutunun ham string çıktısını kullanmak yerine,
-                # güvenli olsun diye tekrar basit listelemeye dönebiliriz ya da
-                # client'ın anladığı formatı oluşturabiliriz. 
-                # En güvenlisi, client'ın beklediği formatı üretmektir.
-                # Ancak json çıktısında "path" alanı olmayabilir.
-                # Basitlik için burada filtreleme yapıp standart list komutunu kullanalım:
-                pass 
-
-        # YUKARIDAKİ JSON MANTIĞI SNAPSHOT İÇİN KARMAŞIK OLABİLİR (Time conversion vs).
-        # Snapshot listesi için GREP yöntemi daha güvenli çünkü ID'yi zaten biliyoruz.
-        # Sadece VM ID'yi bulurken JSON kullandık.
-        
-        filter_str = vmid if "/" in vmid else f"vm/{vmid}"
-        cmd_grep = f"proxmox-backup-client snapshot list --repository {os.environ['PBS_REPOSITORY']} | grep '{filter_str}' | awk '{{print $2}}' | sort -r"
-        result = subprocess.check_output(cmd_grep, shell=True, env=os.environ).decode().strip().split('\n')
+        result = subprocess.check_output(cmd, shell=True, env=os.environ).decode().strip().split('\n')
         snapshots = [s for s in result if s]
-        
         if not snapshots: return {"status": "error", "message": "No snapshots found."}
         return {"status": "success", "snapshots": snapshots}
-
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -209,7 +174,6 @@ async def start_stream(
     config: dict = Depends(get_config)
 ):
     if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
-    
     background_tasks.add_task(run_backup_process, snapshot, remote)
     return {"status": "started", "message": f"Stream Started: {snapshot} -> {remote}"}
 
