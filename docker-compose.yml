@@ -4,17 +4,22 @@ services:
   pbsync:
     build: .
     container_name: pbsync
-    # BU SATIR KRİTİK: Mount işlemi için tam yetki verir
+    # KRİTİK: Sanal disk (Loop Device) oluşturmak için gerekli yetkiler
     privileged: true
-    # Fuse ve Loop cihazlarına erişim izni
-    devices:
-      - /dev/fuse:/dev/fuse
-      - /dev/loop-control:/dev/loop-control
+    pid: "host"  # Host process ID namespace'ini kullan (Loop device için gerekli olabilir)
+    security_opt:
+      - "apparmor:unconfined" # AppArmor kısıtlamalarını kaldır
     cap_add:
       - SYS_ADMIN
       - DAC_READ_SEARCH
+      - MKNOD
+    devices:
+      - /dev/fuse:/dev/fuse
+      - /dev/loop-control:/dev/loop-control
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      - /dev:/dev # Host'un cihazlarını konteynere tanıt
+      - /run/udev:/run/udev:ro # Disk tak/çıkar olaylarını algılamak için
     restart: unless-stopped

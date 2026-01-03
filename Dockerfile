@@ -1,20 +1,20 @@
 # Adım 1: Hazırlık
-FROM python:3.9-slim-bullseye AS base
+FROM python:3.11-slim-bookworm AS base
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Repo anahtarları
+# Repo anahtarları ve gerekli araçlar
 RUN apt-get update && apt-get install -y wget gnupg lsb-release && \
-    echo "deb http://download.proxmox.com/debian/pbs-client $(lsb_release -sc) main" > /etc/apt/sources.list.d/pbs-client.list && \
-    wget https://enterprise.proxmox.com/debian/proxmox-release-bullseye.gpg -O /etc/apt/trusted.gpg.d/proxmox-release-bullseye.gpg && \
-    chmod 644 /etc/apt/trusted.gpg.d/proxmox-release-bullseye.gpg
+    wget https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg -O /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg && \
+    echo "deb http://download.proxmox.com/debian/pbs-client bookworm main" > /etc/apt/sources.list.d/pbs-client.list
 
 # Adım 2: Ana İmaj
-FROM python:3.9-slim-bullseye
+FROM python:3.11-slim-bookworm
 
-COPY --from=base /etc/apt/trusted.gpg.d/proxmox-release-bullseye.gpg /etc/apt/trusted.gpg.d/
+# Anahtarları kopyala
+COPY --from=base /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg /etc/apt/trusted.gpg.d/
 COPY --from=base /etc/apt/sources.list.d/pbs-client.list /etc/apt/sources.list.d/
 
-# Paket kurulumu (kpartx ve dmsetup'a dikkat)
+# Paket kurulumu (fuse3, ntfs-3g, kpartx vb.)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     proxmox-backup-client \
@@ -27,6 +27,7 @@ RUN apt-get update && \
     kpartx \
     fdisk \
     dmsetup \
+    file \
     && apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
