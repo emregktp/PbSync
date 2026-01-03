@@ -2,6 +2,7 @@ import os
 import subprocess
 import time
 import shutil
+import glob
 
 # --- Constants ---
 DRIVE_NAME = "drive-scsi0.img"
@@ -28,7 +29,7 @@ def run_command(command, shell=False, check=True, env=None):
         print(f"ERROR: Command failed. Return Code: {e.returncode}")
         print(f"STDOUT: {e.stdout}")
         print(f"STDERR: {e.stderr}")
-        raise # Hata fırlat
+        raise
 
 def cleanup():
     print("--- Starting Cleanup ---")
@@ -39,96 +40,78 @@ def cleanup():
     run_command(["proxmox-backup-client", "unmap", MAIN_LOOP_DEV], check=False)
     print("--- Cleanup Finished ---")
 
-def detect_and_mount():
+def get_block_device_size(device_path):
     """
-    1. Haritalama (kpartx)
-    2. LVM Aktivasyonu (vgchange)
-    3. Mount edilebilir alanları bulma (lsblk ile genel tarama + filtreleme)
-    4. En büyüğünü mount etme
+    Returns the size of a block device in bytes.
     """
-    print(f"-> Scanning block devices on {MAIN_LOOP_DEV}...")
-    
-    # A. Standart Partitionları Tanıt
     try:
-        run_command(["kpartx", "-a", "-v", "-s", MAIN_LOOP_DEV])
-    except: pass
-    
-    # B. LVM Yapılarını Tanıt
-    try:
-        run_command(["vgscan", "--mknodes"], check=False)
-        run_command(["vgchange", "-ay"], check=False)
-    except: pass
+        res = run_command(["blockdev", "--getsize64", device_path])
+        return int(res.stdout.strip())
+    except:
+        return 0
 
-    time.sleep(2)
-
-    # C. Mount Edilebilir Dosya Sistemlerini Bul
-    # DÜZELTME: lsblk'ya doğrudan /dev/loop0 VERMİYORUZ (Hata 32'yi engeller).
-    # Hepsini listele, Python ile filtrele.
-    cmd = ["lsblk", "-r", "-n", "-o", "NAME,FSTYPE,SIZE"]
-    result = run_command(cmd)
-    
+def find_all_candidates():
+    """
+    Finds all mapped partitions and LVM volumes.
+    Returns a list of device paths sorted by size (largest first).
+    """
     candidates = []
     
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 2: continue
-        
-        name = parts[0]     # örn: loop0p1, dm-0
-        fstype = parts[1]   # örn: ext4, xfs, LVM2_member
-        size = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-        
-        # Sadece loop0 ile alakalı olanları veya mapper (LVM/kpartx) cihazlarını al
-        # loop0 partitionları genelde 'loop0p1' veya 'dm-' olarak görünür.
-        # Basit filtre: Ana disklerimiz loop0 veya mapper altında olmalı.
-        
-        is_relevant = False
-        full_path = ""
+    # 1. Check standard partitions mapped by kpartx (/dev/mapper/loop0p*)
+    partitions = glob.glob("/dev/mapper/loop0p*")
+    for p in partitions:
+        candidates.append(p)
 
-        if "loop0" in name:
-            is_relevant = True
-            full_path = f"/dev/{name}"
-        elif os.path.exists(f"/dev/mapper/{name}"):
-            # Mapper cihazları (kpartx veya LVM) her zaman potansiyel adaydır
-            is_relevant = True
-            full_path = f"/dev/mapper/{name}"
-        
-        if not is_relevant: continue
+    # 2. Check LVM Volumes (Everything in /dev/mapper that isn't loop0p*)
+    #    Be careful not to include control devices.
+    all_mappers = glob.glob("/dev/mapper/*")
+    for m in all_mappers:
+        if m not in partitions and "control" not in m and "loop0" not in m:
+            candidates.append(m)
 
-        # Gereksiz türleri ele
-        if fstype in ['LVM2_member', 'swap', 'iso9660', 'linux_raid_member']: 
-            continue
-        if not fstype: continue # Fstype boşsa (raw partition) atla
-
-        candidates.append({"path": full_path, "fstype": fstype, "size": size})
-
-    if not candidates:
-        print("DEBUG: lsblk output:\n", result.stdout)
-        raise Exception(f"No mountable filesystems (ext4/xfs/ntfs) detected associated with backup!")
-
-    # En büyüğünü seç
-    target = sorted(candidates, key=lambda x: x["size"], reverse=True)[0]
-    target_dev = target["path"]
-    target_fs = target["fstype"]
+    # 3. Sort by size
+    candidates_with_size = []
+    for dev in candidates:
+        size = get_block_device_size(dev)
+        if size > 0:
+            candidates_with_size.append((dev, size))
     
-    print(f"-> Detected Filesystem: {target_fs} on {target_dev} ({target['size']} bytes)")
+    # Sort largest first
+    candidates_with_size.sort(key=lambda x: x[1], reverse=True)
     
-    # D. Mount İşlemi
+    # Just return paths
+    return [x[0] for x in candidates_with_size]
+
+def try_mount(device_path):
+    """
+    Attempts to mount a device with various filesystem types.
+    Returns True if successful.
+    """
+    print(f"-> Trying to mount candidate: {device_path}")
+    
     if not os.path.exists(MOUNT_POINT): os.makedirs(MOUNT_POINT)
-    
-    mount_opts = ["mount", "-o", "ro"]
-    
-    if target_fs == "xfs":
-        mount_opts = ["mount", "-t", "xfs", "-o", "ro,norecovery"]
-    elif target_fs == "ntfs" or target_fs == "ntfs-3g":
-        mount_opts = ["ntfs-3g", "-o", "ro,remove_hiberfile"]
-    
-    print(f"-> Mounting with: {' '.join(mount_opts)} {target_dev}")
-    run_command(mount_opts + [target_dev, MOUNT_POINT])
+
+    # List of mount strategies to try
+    strategies = [
+        ["mount", "-o", "ro", device_path, MOUNT_POINT], # Auto-detect
+        ["mount", "-t", "xfs", "-o", "ro,norecovery", device_path, MOUNT_POINT], # XFS explicit
+        ["ntfs-3g", "-o", "ro,remove_hiberfile", device_path, MOUNT_POINT], # NTFS explicit
+        ["mount", "-t", "ext4", "-o", "ro", device_path, MOUNT_POINT] # EXT4 explicit
+    ]
+
+    for cmd in strategies:
+        try:
+            run_command(cmd)
+            print(f"   SUCCESS! Mounted with: {' '.join(cmd)}")
+            return True
+        except:
+            continue
+            
+    return False
 
 def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
     print(f"\n--- Exploring Snapshot: {snapshot} Path: {path} ---")
     current_env = os.environ.copy()
-    
     cleanup() 
     run_command(["mkdir", "-p", MOUNT_POINT])
 
@@ -141,15 +124,38 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
         run_command(map_cmd, env=current_env)
         time.sleep(2)
 
-        # 2. Detect & Mount
-        detect_and_mount()
+        # 2. Activate Partitions & LVM
+        try: run_command(["kpartx", "-a", "-v", "-s", MAIN_LOOP_DEV])
+        except: pass
+        
+        try: 
+            run_command(["vgscan", "--mknodes"], check=False)
+            run_command(["vgchange", "-ay"], check=False)
+        except: pass
+        
+        time.sleep(1)
 
-        # 3. List Files
+        # 3. Find candidates and Try Mount
+        candidates = find_all_candidates()
+        if not candidates:
+            # Fallback: Try mounting the raw loop device (rare but possible)
+            candidates = [MAIN_LOOP_DEV]
+
+        mounted = False
+        for dev in candidates:
+            if try_mount(dev):
+                mounted = True
+                break
+        
+        if not mounted:
+            return {"status": "error", "message": "Could not mount any partition in backup."}
+
+        # 4. List Files
         safe_path = os.path.normpath(os.path.join(MOUNT_POINT, path.strip('/')))
         if not safe_path.startswith(MOUNT_POINT): safe_path = MOUNT_POINT
 
         if not os.path.exists(safe_path):
-            return {"status": "error", "message": "Path not found"}
+            return {"status": "error", "message": "Path not found inside backup"}
 
         items = []
         with os.scandir(safe_path) as entries:
@@ -189,11 +195,30 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         run_command(map_cmd, env=current_env)
         time.sleep(2)
 
-        # 2. Detect & Mount
-        detect_and_mount()
-        print("-> Mount successful.")
+        # 2. Activate Partitions & LVM
+        print("-> Activating partitions...")
+        try: run_command(["kpartx", "-a", "-v", "-s", MAIN_LOOP_DEV])
+        except: pass
+        try: 
+            run_command(["vgscan", "--mknodes"], check=False)
+            run_command(["vgchange", "-ay"], check=False)
+        except: pass
+        time.sleep(1)
 
-        # 3. Stream Setup
+        # 3. Mount Strategy (Brute Force)
+        candidates = find_all_candidates()
+        if not candidates: candidates = [MAIN_LOOP_DEV]
+        
+        mounted = False
+        for dev in candidates:
+            if try_mount(dev):
+                mounted = True
+                break
+        
+        if not mounted:
+            raise Exception("Failed to mount any filesystem from the snapshot.")
+
+        # 4. Stream Setup
         vmid = snapshot.split('/')[1]
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         archive_name = f"{vmid}_{timestamp}.tar.gz"
