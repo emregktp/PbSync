@@ -1,18 +1,21 @@
 import os
 import subprocess
 import time
-import re
+import json
 import shutil
 
 # --- Constants ---
 DRIVE_NAME = "drive-scsi0.img"
 MAIN_LOOP_DEV = "/dev/loop0"
-# İkinci bir loop cihazı (Partition için) dinamik olarak atanacak
 MOUNT_POINT = "/mnt/pbsync_restore"
 LOG_FILE_PATH = "/app/data/pbsync_stream.log"
 
 def run_command(command, shell=False, check=True, env=None):
-    print(f"COMMAND: {' '.join(command) if isinstance(command, list) else command}")
+    """
+    Runs a command and logs its output.
+    """
+    cmd_str = ' '.join(command) if isinstance(command, list) else command
+    print(f"COMMAND: {cmd_str}")
     try:
         process_env = os.environ.copy()
         if env: process_env.update(env)
@@ -20,8 +23,11 @@ def run_command(command, shell=False, check=True, env=None):
         result = subprocess.run(
             command, shell=shell, check=check, capture_output=True, text=True, env=process_env
         )
-        if result.stdout: print(f"STDOUT: {result.stdout.strip()}")
-        if result.stderr: print(f"STDERR: {result.stderr.strip()}")
+        # Log stdout only if useful (keep logs clean)
+        if result.stdout and not cmd_str.startswith("lsblk"): 
+            print(f"STDOUT: {result.stdout.strip()[:200]}...") # Truncate long logs
+        if result.stderr: 
+            print(f"STDERR: {result.stderr.strip()}")
         return result
     except subprocess.CalledProcessError as e:
         print(f"ERROR: Command failed. Return Code: {e.returncode}")
@@ -30,115 +36,146 @@ def run_command(command, shell=False, check=True, env=None):
         raise
 
 def cleanup():
+    """
+    Cleans up all mounts and maps.
+    """
     print("--- Starting Cleanup ---")
+    
     # 1. Unmount
     run_command(["umount", "-l", MOUNT_POINT], check=False)
     
-    # 2. Partition Loop cihazlarını temizle (loop0 haricindekiler)
-    try:
-        # Tüm loop cihazlarını bul ve temizle
-        out = subprocess.check_output(["losetup", "-a"], text=True)
-        for line in out.splitlines():
-            # Eğer loop0 üzerine kurulu başka bir loop varsa (offsetli) onu sil
-            if "loop0)" in line or "loop0 (" in line: 
-                parts = line.split(":")
-                loop_dev = parts[0]
-                if loop_dev != MAIN_LOOP_DEV:
-                    print(f"Cleaning up partition loop: {loop_dev}")
-                    run_command(["losetup", "-d", loop_dev], check=False)
-    except:
-        pass
+    # 2. Clean up partition mappings (kpartx)
+    run_command(["kpartx", "-d", MAIN_LOOP_DEV], check=False)
+    run_command(["dmsetup", "remove_all"], check=False) # Force remove mappers
 
-    # 3. Ana PBS Map işlemini kaldır
+    # 3. Unmap the main drive
     run_command(["proxmox-backup-client", "unmap", MAIN_LOOP_DEV], check=False)
     print("--- Cleanup Finished ---")
 
-def get_partition_offset_and_setup_loop(device_path):
+def get_mount_target():
     """
-    1. fdisk ile diski okur.
-    2. En büyük partition'ın başlangıç sektörünü bulur.
-    3. Offset hesabı yapar (Sektör * 512).
-    4. losetup ile o offsete yeni bir loop cihazı bağlar.
+    Uses kpartx to map partitions and lsblk (JSON) to find the largest partition.
+    Returns the path to the device node to be mounted.
     """
-    print(f"-> Analyzing partition table for '{device_path}'...")
+    print(f"-> analyzing block device structure for {MAIN_LOOP_DEV}...")
     
+    # 1. Force kernel to scan partitions using kpartx
+    # -a: add, -v: verbose, -s: sync (wait)
     try:
-        # fdisk çıktısını al
-        cmd = ["fdisk", "-l", "-o", "Start,Sectors,Type", device_path]
-        result = run_command(cmd, check=False)
+        run_command(["kpartx", "-a", "-v", "-s", MAIN_LOOP_DEV])
+    except:
+        print("Warning: kpartx failed, trying to proceed...")
+
+    time.sleep(2) # Wait for device nodes to settle
+
+    # 2. Use lsblk with JSON output for reliable parsing
+    # This avoids "text parsing" errors with column widths
+    try:
+        cmd = ["lsblk", "-b", "-J", "-o", "NAME,SIZE,TYPE,KNAME,PKNAME"]
+        result = run_command(cmd)
+        data = json.loads(result.stdout)
         
-        lines = result.stdout.strip().split('\n')
-        partitions = []
-        sector_size = 512 # Varsayılan
+        candidates = []
+
+        # Helper to find loop0 and its children
+        def find_loop0_children(devices):
+            found_parts = []
+            for dev in devices:
+                # If this is loop0, check its children
+                if dev.get("name") == "loop0" or dev.get("kname") == "loop0":
+                    if "children" in dev:
+                        return dev["children"]
+                # Recursive search
+                if "children" in dev:
+                    child_res = find_loop0_children(dev["children"])
+                    if child_res: return child_res
+            return []
+
+        children = find_loop0_children(data.get("blockdevices", []))
         
-        # Sektör boyutunu teyit et
-        for line in lines:
-            if "Units:" in line and "bytes" in line:
-                match = re.search(r'=\s*(\d+)\s*bytes', line)
-                if match: sector_size = int(match.group(1))
+        # If logical partitions found via lsblk structure
+        for child in children:
+            # We construct full path. Usually /dev/mapper/loop0pX or /dev/loop0pX
+            dev_name = child.get("name")
+            size = int(child.get("size", 0))
+            
+            # Try to resolve actual path
+            possible_paths = [
+                f"/dev/mapper/{dev_name}",
+                f"/dev/{dev_name}"
+            ]
+            
+            final_path = None
+            for p in possible_paths:
+                if os.path.exists(p):
+                    final_path = p
+                    break
+            
+            if final_path:
+                candidates.append({"path": final_path, "size": size})
 
-        # Partition satırlarını parse et
-        for line in lines:
-            parts = line.split()
-            # Sayı ile başlayan satırlar partition bilgisidir
-            if not parts or not parts[0].isdigit(): continue
-                
-            try:
-                start_sector = int(parts[0])
-                total_sectors = int(parts[1])
-                size_bytes = total_sectors * sector_size
-                offset_bytes = start_sector * sector_size
-                
-                partitions.append({"offset": offset_bytes, "size": size_bytes})
-            except: continue
+        # Fallback: Check /dev/mapper manually if lsblk didn't link them
+        if not candidates:
+            if os.path.exists("/dev/mapper/loop0p1"):
+                # Basic guessing for single partition
+                return "/dev/mapper/loop0p1"
+            elif os.path.exists("/dev/mapper/loop0p2"):
+                return "/dev/mapper/loop0p2"
 
-        if not partitions:
-            print("-> No partition table found. Assuming RAW filesystem.")
-            return device_path # Offset yok, direkt cihazı dön
-
-        # En büyük partition'ı seç
-        largest = sorted(partitions, key=lambda x: x["size"], reverse=True)[0]
-        offset = largest["offset"]
-        print(f"-> Largest partition detected at Offset: {offset} bytes (Size: {largest['size']})")
-
-        # YENİ LOOP CİHAZI OLUŞTUR (Offsetli)
-        # losetup -f --show --offset X /dev/loop0
-        print(f"-> Creating dedicated loop device for partition...")
-        setup_res = run_command(["losetup", "--find", "--show", "--offset", str(offset), device_path])
-        new_loop_dev = setup_res.stdout.strip()
-        
-        return new_loop_dev
+        if candidates:
+            # Return the largest partition
+            largest = sorted(candidates, key=lambda x: x["size"], reverse=True)[0]
+            print(f"-> Largest partition found: {largest['path']} ({largest['size']} bytes)")
+            return largest["path"]
+        else:
+            print("-> No partitions detected. Using raw device.")
+            return MAIN_LOOP_DEV
 
     except Exception as e:
-        print(f"WARNING: Partition logic failed ({e}). Returning raw device.")
-        return device_path
+        print(f"WARNING: Partition detection failed ({e}). Defaulting to {MAIN_LOOP_DEV}")
+        return MAIN_LOOP_DEV
 
-def mount_device(device_path):
+def mount_filesystem(device_path):
     """
-    Farklı dosya sistemi türlerini deneyerek mount eder.
+    Tries multiple mount methods (Auto, NTFS, XFS).
     """
     print(f"-> Attempting to mount: {device_path}")
     
-    # 1. Deneme: Auto (ext4, xfs vb)
-    try:
-        run_command(["mount", "-o", "ro", device_path, MOUNT_POINT])
-        return
-    except: pass
+    # Ensure directory exists
+    if not os.path.exists(MOUNT_POINT):
+        os.makedirs(MOUNT_POINT)
 
-    # 2. Deneme: NTFS (Kirli olsa bile zorla)
+    errors = []
+
+    # Strategy 1: Standard Linux Mount (ext4, xfs, etc.)
     try:
-        # remove_hiberfile: Windows düzgün kapanmadıysa açılmasını sağlar
+        # ro: read-only, norecovery: don't replay journals (safe for backup)
+        run_command(["mount", "-o", "ro,norecovery", device_path, MOUNT_POINT])
+        return
+    except Exception as e: errors.append(str(e))
+
+    # Strategy 2: NTFS-3G (Windows)
+    try:
+        # remove_hiberfile: clears hibernation flag if needed to read
         run_command(["ntfs-3g", "-o", "ro,remove_hiberfile", device_path, MOUNT_POINT])
         return
-    except: pass
+    except Exception as e: errors.append(str(e))
 
-    # 3. Deneme: XFS (Log replay yapmadan)
+    # Strategy 3: XFS Explicit
     try:
         run_command(["mount", "-t", "xfs", "-o", "ro,norecovery", device_path, MOUNT_POINT])
         return
-    except: pass
+    except Exception as e: errors.append(str(e))
 
-    raise Exception(f"Could not mount {device_path}. All filesystem drivers failed.")
+    # Strategy 4: Fallback simple mount
+    try:
+        run_command(["mount", "-o", "ro", device_path, MOUNT_POINT])
+        return
+    except Exception as e: errors.append(str(e))
+
+    print("ALL MOUNT ATTEMPTS FAILED.")
+    print(f"Errors: {errors}")
+    raise Exception(f"Could not mount {device_path}. Check if filesystem is supported.")
 
 def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
     print(f"\n--- Exploring Snapshot: {snapshot} Path: {path} ---")
@@ -154,15 +191,13 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
             "--repository", config['pbs_repository_path']
         ]
         run_command(map_cmd, env=current_env)
-        time.sleep(1)
+        time.sleep(2)
 
-        # 2. Offset Bul ve Yeni Loop Oluştur
-        target_dev = get_partition_offset_and_setup_loop(MAIN_LOOP_DEV)
+        # 2. Find Partition & Mount
+        target_dev = get_mount_target()
+        mount_filesystem(target_dev)
 
-        # 3. Mount
-        mount_device(target_dev)
-
-        # 4. Listele
+        # 3. List
         safe_path = os.path.normpath(os.path.join(MOUNT_POINT, path.strip('/')))
         if not safe_path.startswith(MOUNT_POINT): safe_path = MOUNT_POINT
 
@@ -207,9 +242,9 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         run_command(map_cmd, env=current_env)
         time.sleep(2)
 
-        # 2. Partition Offset & Mount
-        target_dev = get_partition_offset_and_setup_loop(MAIN_LOOP_DEV)
-        mount_device(target_dev)
+        # 2. Find Partition & Mount
+        target_dev = get_mount_target()
+        mount_filesystem(target_dev)
         print("-> Mount successful.")
 
         # 3. Stream Setup
