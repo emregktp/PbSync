@@ -40,7 +40,7 @@
             --pbs-input-text: #e0e0e0;
             --pbs-input-disabled: #2a2a2a;
             --pbs-hint-bg: #2a2a2a;
-            --pbs-hint-text: #ccc;
+            --pbs-hint-text: #ddd; /* Daha parlak hint */
             --pbs-modal-bg: #212121;
         }
 
@@ -54,6 +54,23 @@
             display: flex;
             flex-direction: column;
             transition: all 0.3s;
+        }
+
+        /* --- PLACEHOLDER & HINT COLORS FIX --- */
+        .form-control::placeholder {
+            color: #999;
+            opacity: 0.8;
+        }
+        [data-theme="dark"] .form-control::placeholder {
+            color: #9e9e9e !important; /* Çok daha parlak gri */
+            opacity: 1 !important;
+        }
+        
+        .form-text {
+            color: var(--pbs-text-muted);
+        }
+        [data-theme="dark"] .form-text {
+            color: #aaa !important; /* Form altı yazıları parlaklaştır */
         }
 
         /* --- HEADER --- */
@@ -160,16 +177,6 @@
         .form-control:focus, .form-select:focus {
             background-color: var(--pbs-input-bg); border-color: var(--pbs-blue);
             color: var(--pbs-input-text); box-shadow: 0 0 0 2px rgba(56, 146, 214, 0.2);
-        }
-
-        /* --- PLACEHOLDER FIX (PARLAKLAŞTIRMA) --- */
-        .form-control::placeholder {
-            color: #999;
-            opacity: 0.6;
-        }
-        [data-theme="dark"] .form-control::placeholder {
-            color: #cccccc !important; /* Çok daha parlak bir gri */
-            opacity: 1 !important;
         }
         
         /* HINT BOX */
@@ -417,7 +424,7 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 
     <script>
-        // ... (JS AYNI KALACAK, DEĞİŞİKLİK YOK) ...
+        // ... (JS KODLARI AYNEN KALIYOR) ...
         // --- Theme Logic ---
         function setTheme(theme) {
             const html = document.documentElement;

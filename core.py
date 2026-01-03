@@ -1,7 +1,6 @@
 import os
 import subprocess
 import time
-import json
 import shutil
 
 # --- Constants ---
@@ -11,9 +10,6 @@ MOUNT_POINT = "/mnt/pbsync_restore"
 LOG_FILE_PATH = "/app/data/pbsync_stream.log"
 
 def run_command(command, shell=False, check=True, env=None):
-    """
-    Runs a command and logs its output.
-    """
     cmd_str = ' '.join(command) if isinstance(command, list) else command
     print(f"COMMAND: {cmd_str}")
     try:
@@ -23,9 +19,8 @@ def run_command(command, shell=False, check=True, env=None):
         result = subprocess.run(
             command, shell=shell, check=check, capture_output=True, text=True, env=process_env
         )
-        # Log stdout only if useful (keep logs clean)
-        if result.stdout and not cmd_str.startswith("lsblk"): 
-            print(f"STDOUT: {result.stdout.strip()[:200]}...") # Truncate long logs
+        if result.stdout and not "lsblk" in cmd_str: 
+            print(f"STDOUT: {result.stdout.strip()[:200]}...")
         if result.stderr: 
             print(f"STDERR: {result.stderr.strip()}")
         return result
@@ -33,149 +28,101 @@ def run_command(command, shell=False, check=True, env=None):
         print(f"ERROR: Command failed. Return Code: {e.returncode}")
         print(f"STDOUT: {e.stdout}")
         print(f"STDERR: {e.stderr}")
-        raise
+        raise # Hata fırlat ki üst katman yakalasın
 
 def cleanup():
-    """
-    Cleans up all mounts and maps.
-    """
     print("--- Starting Cleanup ---")
-    
     # 1. Unmount
     run_command(["umount", "-l", MOUNT_POINT], check=False)
     
-    # 2. Clean up partition mappings (kpartx)
+    # 2. Deactivate LVM (Önemli: LVM kilitlerini kaldırır)
+    run_command(["vgchange", "-an"], check=False)
+    
+    # 3. Clean up partition mappings
     run_command(["kpartx", "-d", MAIN_LOOP_DEV], check=False)
-    run_command(["dmsetup", "remove_all"], check=False) # Force remove mappers
+    run_command(["dmsetup", "remove_all"], check=False)
 
-    # 3. Unmap the main drive
+    # 4. Unmap main drive
     run_command(["proxmox-backup-client", "unmap", MAIN_LOOP_DEV], check=False)
     print("--- Cleanup Finished ---")
 
-def get_mount_target():
+def detect_and_mount():
     """
-    Uses kpartx to map partitions and lsblk (JSON) to find the largest partition.
-    Returns the path to the device node to be mounted.
+    1. Haritalama (kpartx)
+    2. LVM Aktivasyonu (vgchange)
+    3. Mount edilebilir alanları (ext4, xfs, ntfs) bulma
+    4. En büyüğünü mount etme
     """
-    print(f"-> analyzing block device structure for {MAIN_LOOP_DEV}...")
+    print(f"-> Scanning block devices on {MAIN_LOOP_DEV}...")
     
-    # 1. Force kernel to scan partitions using kpartx
-    # -a: add, -v: verbose, -s: sync (wait)
+    # A. Standart Partitionları Tanıt
     try:
         run_command(["kpartx", "-a", "-v", "-s", MAIN_LOOP_DEV])
-    except:
-        print("Warning: kpartx failed, trying to proceed...")
-
-    time.sleep(2) # Wait for device nodes to settle
-
-    # 2. Use lsblk with JSON output for reliable parsing
-    # This avoids "text parsing" errors with column widths
-    try:
-        cmd = ["lsblk", "-b", "-J", "-o", "NAME,SIZE,TYPE,KNAME,PKNAME"]
-        result = run_command(cmd)
-        data = json.loads(result.stdout)
-        
-        candidates = []
-
-        # Helper to find loop0 and its children
-        def find_loop0_children(devices):
-            found_parts = []
-            for dev in devices:
-                # If this is loop0, check its children
-                if dev.get("name") == "loop0" or dev.get("kname") == "loop0":
-                    if "children" in dev:
-                        return dev["children"]
-                # Recursive search
-                if "children" in dev:
-                    child_res = find_loop0_children(dev["children"])
-                    if child_res: return child_res
-            return []
-
-        children = find_loop0_children(data.get("blockdevices", []))
-        
-        # If logical partitions found via lsblk structure
-        for child in children:
-            # We construct full path. Usually /dev/mapper/loop0pX or /dev/loop0pX
-            dev_name = child.get("name")
-            size = int(child.get("size", 0))
-            
-            # Try to resolve actual path
-            possible_paths = [
-                f"/dev/mapper/{dev_name}",
-                f"/dev/{dev_name}"
-            ]
-            
-            final_path = None
-            for p in possible_paths:
-                if os.path.exists(p):
-                    final_path = p
-                    break
-            
-            if final_path:
-                candidates.append({"path": final_path, "size": size})
-
-        # Fallback: Check /dev/mapper manually if lsblk didn't link them
-        if not candidates:
-            if os.path.exists("/dev/mapper/loop0p1"):
-                # Basic guessing for single partition
-                return "/dev/mapper/loop0p1"
-            elif os.path.exists("/dev/mapper/loop0p2"):
-                return "/dev/mapper/loop0p2"
-
-        if candidates:
-            # Return the largest partition
-            largest = sorted(candidates, key=lambda x: x["size"], reverse=True)[0]
-            print(f"-> Largest partition found: {largest['path']} ({largest['size']} bytes)")
-            return largest["path"]
-        else:
-            print("-> No partitions detected. Using raw device.")
-            return MAIN_LOOP_DEV
-
-    except Exception as e:
-        print(f"WARNING: Partition detection failed ({e}). Defaulting to {MAIN_LOOP_DEV}")
-        return MAIN_LOOP_DEV
-
-def mount_filesystem(device_path):
-    """
-    Tries multiple mount methods (Auto, NTFS, XFS).
-    """
-    print(f"-> Attempting to mount: {device_path}")
+    except: pass
     
-    # Ensure directory exists
-    if not os.path.exists(MOUNT_POINT):
-        os.makedirs(MOUNT_POINT)
-
-    errors = []
-
-    # Strategy 1: Standard Linux Mount (ext4, xfs, etc.)
+    # B. LVM Yapılarını Tanıt (Linux VM'ler için kritik)
+    # vgscan: Volume Groupları bul, vgchange -ay: Hepsini aktif et
     try:
-        # ro: read-only, norecovery: don't replay journals (safe for backup)
-        run_command(["mount", "-o", "ro,norecovery", device_path, MOUNT_POINT])
-        return
-    except Exception as e: errors.append(str(e))
+        run_command(["vgscan", "--mknodes"], check=False)
+        run_command(["vgchange", "-ay"], check=False)
+    except: pass
 
-    # Strategy 2: NTFS-3G (Windows)
-    try:
-        # remove_hiberfile: clears hibernation flag if needed to read
-        run_command(["ntfs-3g", "-o", "ro,remove_hiberfile", device_path, MOUNT_POINT])
-        return
-    except Exception as e: errors.append(str(e))
+    time.sleep(2) # Kernel'in cihazları oluşturmasını bekle
 
-    # Strategy 3: XFS Explicit
-    try:
-        run_command(["mount", "-t", "xfs", "-o", "ro,norecovery", device_path, MOUNT_POINT])
-        return
-    except Exception as e: errors.append(str(e))
+    # C. Mount Edilebilir Dosya Sistemlerini Bul
+    # lsblk ile sadece FSTYPE'ı olan (yani mount edilebilen) cihazları listele
+    # Çıktı formatı: NAME FSTYPE SIZE
+    cmd = ["lsblk", "-r", "-n", "-o", "NAME,FSTYPE,SIZE"]
+    result = run_command(cmd)
+    
+    candidates = []
+    
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2: continue # FSTYPE yoksa atla (örn: ham partition, swap)
+        
+        name = parts[0]
+        fstype = parts[1]
+        size = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        
+        # Gereksizleri filtrele
+        if fstype in ['LVM2_member', 'swap', 'iso9660', 'linux_raid_member']: 
+            continue
+        if not fstype: continue
 
-    # Strategy 4: Fallback simple mount
-    try:
-        run_command(["mount", "-o", "ro", device_path, MOUNT_POINT])
-        return
-    except Exception as e: errors.append(str(e))
+        # Tam yolu oluştur
+        dev_path = f"/dev/{name}"
+        # Eğer /dev/mapper altında ise (LVM veya kpartx) orayı kullan
+        if os.path.exists(f"/dev/mapper/{name}"):
+            dev_path = f"/dev/mapper/{name}"
+            
+        # Loop cihazının kendisini (iso9660 değilse) hariç tutmaya gerek yok, 
+        # bazen direkt formatlı olabilir. Ama genelde partition arıyoruz.
+        
+        candidates.append({"path": dev_path, "fstype": fstype, "size": size})
 
-    print("ALL MOUNT ATTEMPTS FAILED.")
-    print(f"Errors: {errors}")
-    raise Exception(f"Could not mount {device_path}. Check if filesystem is supported.")
+    if not candidates:
+        raise Exception("No mountable filesystems (ext4/xfs/ntfs) detected! Disk might be encrypted or raw.")
+
+    # En büyüğünü seç (Genellikle data partition'ıdır)
+    target = sorted(candidates, key=lambda x: x["size"], reverse=True)[0]
+    target_dev = target["path"]
+    target_fs = target["fstype"]
+    
+    print(f"-> Detected Filesystem: {target_fs} on {target_dev} ({target['size']} bytes)")
+    
+    # D. Mount İşlemi
+    if not os.path.exists(MOUNT_POINT): os.makedirs(MOUNT_POINT)
+    
+    mount_opts = ["mount", "-o", "ro"] # Read-only varsayılan
+    
+    if target_fs == "xfs":
+        mount_opts = ["mount", "-t", "xfs", "-o", "ro,norecovery"]
+    elif target_fs == "ntfs" or target_fs == "ntfs-3g":
+        mount_opts = ["ntfs-3g", "-o", "ro,remove_hiberfile"]
+    
+    print(f"-> Mounting with: {' '.join(mount_opts)} {target_dev}")
+    run_command(mount_opts + [target_dev, MOUNT_POINT])
 
 def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
     print(f"\n--- Exploring Snapshot: {snapshot} Path: {path} ---")
@@ -193,11 +140,10 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
         run_command(map_cmd, env=current_env)
         time.sleep(2)
 
-        # 2. Find Partition & Mount
-        target_dev = get_mount_target()
-        mount_filesystem(target_dev)
+        # 2. Detect & Mount
+        detect_and_mount()
 
-        # 3. List
+        # 3. List Files
         safe_path = os.path.normpath(os.path.join(MOUNT_POINT, path.strip('/')))
         if not safe_path.startswith(MOUNT_POINT): safe_path = MOUNT_POINT
 
@@ -242,9 +188,8 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         run_command(map_cmd, env=current_env)
         time.sleep(2)
 
-        # 2. Find Partition & Mount
-        target_dev = get_mount_target()
-        mount_filesystem(target_dev)
+        # 2. Detect & Mount
+        detect_and_mount()
         print("-> Mount successful.")
 
         # 3. Stream Setup
