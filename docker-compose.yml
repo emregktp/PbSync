@@ -4,11 +4,13 @@ services:
   pbsync:
     build: .
     container_name: pbsync
-    # Grants full access to devices (needed for loop/fuse)
+    # Sistem aygıtlarına tam erişim için:
     privileged: true
-    # CRITICAL FOR UBUNTU 24.04: Disables AppArmor for this container
+    # Ubuntu 24.04 FIX: AppArmor'u devre dışı bırak
     security_opt:
       - "apparmor:unconfined"
+    # Host işlemlerini görebilmek için
+    pid: "host"
     cap_add:
       - SYS_ADMIN
       - DAC_READ_SEARCH
@@ -20,6 +22,7 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      # Host'un disklerini içeri aktar (Kritik)
       - /dev:/dev
       - /run/udev:/run/udev:ro
     restart: unless-stopped
