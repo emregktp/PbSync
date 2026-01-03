@@ -4,15 +4,17 @@ services:
   pbsync:
     build: .
     container_name: pbsync
-    restart: unless-stopped
+    # BU SATIR KRİTİK: Mount işlemi için tam yetki verir
+    privileged: true
+    # Fuse ve Loop cihazlarına erişim izni
+    devices:
+      - /dev/fuse:/dev/fuse
+      - /dev/loop-control:/dev/loop-control
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
     ports:
       - "8000:8000"
     volumes:
-      # Ayarların kaybolmaması için data klasörünü dışarı bağlıyoruz
       - ./data:/app/data
-    cap_add:
-      - SYS_ADMIN
-    devices:
-      - /dev/fuse:/dev/fuse
-    security_opt:
-      - apparmor:unconfined
+    restart: unless-stopped
