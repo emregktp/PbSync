@@ -8,8 +8,11 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      # Ayarların kaybolmaması için data klasörünü dışarı bağlıyoruz
       - ./data:/app/data
     cap_add:
       - SYS_ADMIN
     devices:
       - /dev/fuse:/dev/fuse
+    security_opt:
+      - apparmor:unconfined
