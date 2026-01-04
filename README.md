@@ -42,7 +42,7 @@ apt install -y proxmox-backup-client kpartx lvm2 ntfs-3g fdisk
 
 ```bash
 # Repoyu klonlayın
-git clone [https://github.com/KULLANICI_ADIN/PbSync.git](https://github.com/KULLANICI_ADIN/PbSync.git)
+git clone [https://github.com/emregktp/PbSync.git](https://github.com/emregktp/PbSync.git)
 cd PbSync
 
 # Uygulamayı başlatın
