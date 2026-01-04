@@ -19,10 +19,9 @@ def append_log(msg):
             f.write(msg + "\n")
     except: pass
 
-def run_host_command(command, env=None):
+def run_host_command(command, env=None, suppress_errors=False):
     cmd_str = ' '.join(command) if isinstance(command, list) else command
-    # append_log(f"HOST_EXEC: {cmd_str}") 
-    print(f"HOST_EXEC: {cmd_str}")
+    # print(f"HOST_EXEC: {cmd_str}") # Debug için
 
     env_prefix = ""
     if env:
@@ -37,20 +36,23 @@ def run_host_command(command, env=None):
         )
         return result
     except subprocess.CalledProcessError as e:
-        append_log(f"ERROR on HOST: {e.returncode} | {e.stderr.strip()}")
+        if not suppress_errors:
+            error_msg = f"ERROR on HOST: {e.returncode} | {e.stderr.strip()}"
+            print(error_msg)
+            # Log dosyasına basarak kullanıcıyı korkutmaya gerek yok, sadece konsola bas.
         raise e
 
 def cleanup():
-    print("--- Cleaning up ---")
-    try: run_host_command(f"umount -l {MOUNT_POINT}")
+    # Cleanup hatalarını (zaten unmount edilmişse vs.) gizle
+    try: run_host_command(f"umount -l {MOUNT_POINT}", suppress_errors=True)
     except: pass
-    try: run_host_command("vgchange -an")
+    try: run_host_command("vgchange -an", suppress_errors=True)
     except: pass
-    try: run_host_command("dmsetup remove_all")
+    try: run_host_command("dmsetup remove_all", suppress_errors=True)
     except: pass
-    try: run_host_command(f"proxmox-backup-client unmap {DRIVE_NAME}")
+    try: run_host_command(f"proxmox-backup-client unmap {DRIVE_NAME}", suppress_errors=True)
     except: pass
-    try: run_host_command("losetup -D") 
+    try: run_host_command("losetup -D", suppress_errors=True) 
     except: pass
 
 def find_loop_on_host():
@@ -150,11 +152,18 @@ def list_files_or_partitions(config: dict, snapshot: str, partition_id: str = No
 
     try:
         run_host_command(f"proxmox-backup-client map {snapshot} {DRIVE_NAME} --repository {config['pbs_repository_path']}", env=host_env)
-        time.sleep(1)
+        # Timeout arttırıldı: Disklerin oluşması için daha fazla zaman (Mount failed hatası için)
+        time.sleep(2) 
+        
         active_loop = find_loop_on_host()
         if not active_loop: return {"status": "error", "message": "Loop device not found."}
 
         if partition_id is None:
+            # Partition tarama öncesi aktivasyon
+            try: run_host_command(f"kpartx -a -v -s {active_loop}")
+            except: pass
+            time.sleep(1) 
+            
             candidates = get_candidates(active_loop)
             partitions_list = []
             for idx, c in enumerate(candidates):
@@ -201,17 +210,22 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         cleanup()
         append_log("-> Mapping snapshot on Host...")
         run_host_command(f"proxmox-backup-client map {snapshot} {DRIVE_NAME} --repository {config['pbs_repository_path']}", env=host_env)
-        time.sleep(2)
+        time.sleep(3) # Streaming için daha güvenli bekleme süresi
 
         active_loop = find_loop_on_host()
         if not active_loop: raise Exception("Loop device not found on host.")
         append_log(f"-> Active Loop: {active_loop}")
 
         append_log("-> Scanning for partitions...")
+        
+        # Aktivasyon
+        try: run_host_command(f"kpartx -a -v -s {active_loop}")
+        except: pass
+        time.sleep(1)
+
         candidates = get_candidates(active_loop)
         
         mounted = False
-        # Sondan başa dene (Genelde büyük partition sondadır)
         for idx in range(len(candidates)-1, -1, -1):
             if mount_partition_by_index(active_loop, idx):
                 mounted = True
@@ -220,15 +234,11 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         
         if not mounted: raise Exception("Mount failed on Host.")
 
-        # -- Rclone Path Fix --
         vmid = snapshot.split('/')[1]
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         archive_name = f"{vmid}_{timestamp}.tar.gz"
         
-        # Remote ismindeki fazladan ':' işaretini temizle
         clean_remote = remote.rstrip(":")
-        
-        # Tam yol oluştur: remote:folder/file
         if target_folder.strip():
             full_remote_path = f"{clean_remote}:{target_folder.strip().strip('/')}/{archive_name}"
         else:
