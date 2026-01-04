@@ -8,10 +8,10 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 from core import run_backup_process, list_files_or_partitions
 
-# --- AYARLAR ---
 CONFIG_DIR = "/app/data"
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 RCLONE_CONFIG_PATH = os.path.join(CONFIG_DIR, "rclone.conf")
+LOG_FILE_PATH = "/app/data/pbsync_stream.log"
 
 app = FastAPI(title="PbSync")
 templates = Jinja2Templates(directory="templates")
@@ -135,17 +135,14 @@ async def scan_snapshots(vmid: str = Form(...), config: dict = Depends(get_confi
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# --- EXPLORER (UPDATED) ---
 @app.post("/explore")
 async def explore_snapshot(
     snapshot: str = Form(...), 
     path: str = Form(""),
-    partition_id: str = Form(None), # YENİ: Kullanıcının seçtiği partition indexi
+    partition_id: str = Form(None), 
     config: dict = Depends(get_config)
 ):
     if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
-    
-    # Core fonksiyon artık hem partition listelemeyi hem dosya listelemeyi yönetiyor
     result = list_files_or_partitions(config, snapshot, partition_id, path)
     return result
 
@@ -161,6 +158,23 @@ async def start_stream(
     if not config: return JSONResponse({"status": "error", "message": "No Config"}, 401)
     background_tasks.add_task(run_backup_process, config, snapshot, remote, target_folder, source_paths)
     return {"status": "started", "message": f"Stream Started: {snapshot} -> {remote}"}
+
+# --- LOG OKUMA ENDPOINTI (YENİ) ---
+@app.get("/stream-logs")
+async def get_stream_logs():
+    if not os.path.exists(LOG_FILE_PATH):
+        return {"logs": "Waiting for logs..."}
+    
+    # Dosyanın son 4KB'ını oku (Hepsini okuyup sistemi yorma)
+    try:
+        with open(LOG_FILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            f.seek(0, 2) # Sona git
+            size = f.tell()
+            f.seek(max(size - 4000, 0)) # Son 4000 byte'ı al
+            content = f.read()
+            return {"logs": content}
+    except Exception as e:
+        return {"logs": f"Error reading logs: {e}"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
