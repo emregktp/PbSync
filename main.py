@@ -8,13 +8,28 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 from core import run_backup_process, list_files_or_partitions
 
+# --- AYARLAR ---
 CONFIG_DIR = "/app/data"
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 RCLONE_CONFIG_PATH = os.path.join(CONFIG_DIR, "rclone.conf")
 LOG_FILE_PATH = "/app/data/pbsync_stream.log"
 
 app = FastAPI(title="PbSync")
-templates = Jinja2Templates(directory="templates")
+
+# --- TEMPLATE YOLU DÜZELTMESİ (ABSOLUTE PATH) ---
+# Bu dosyanın (main.py) bulunduğu klasörü tam yol olarak alıyoruz
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# templates klasörünün tam yolunu oluşturuyoruz (/app/templates)
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
+
+# Debug için loga basıyoruz (konsolda görünür)
+print(f"--> Loading templates from: {TEMPLATES_DIR}")
+
+# Eğer klasör yoksa hata vermemesi için kontrol (gerçi ls ile var olduğunu gördük)
+if not os.path.isdir(TEMPLATES_DIR):
+    print(f"CRITICAL ERROR: Templates directory not found at {TEMPLATES_DIR}")
+
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 def get_config():
     if not os.path.exists(CONFIG_FILE):
@@ -159,18 +174,16 @@ async def start_stream(
     background_tasks.add_task(run_backup_process, config, snapshot, remote, target_folder, source_paths)
     return {"status": "started", "message": f"Stream Started: {snapshot} -> {remote}"}
 
-# --- LOG OKUMA ENDPOINTI (YENİ) ---
 @app.get("/stream-logs")
 async def get_stream_logs():
     if not os.path.exists(LOG_FILE_PATH):
         return {"logs": "Waiting for logs..."}
     
-    # Dosyanın son 4KB'ını oku (Hepsini okuyup sistemi yorma)
     try:
         with open(LOG_FILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
-            f.seek(0, 2) # Sona git
+            f.seek(0, 2) 
             size = f.tell()
-            f.seek(max(size - 4000, 0)) # Son 4000 byte'ı al
+            f.seek(max(size - 4000, 0)) 
             content = f.read()
             return {"logs": content}
     except Exception as e:
