@@ -8,26 +8,23 @@ import re
 
 # --- Constants ---
 DRIVE_NAME = "drive-scsi0.img"
-# Host ve Docker'da aynı yol olmalı (docker-compose'da bind edildi)
+# Host ve Docker arasında paylaşılan alan (/mnt bind edildi)
 MOUNT_POINT = "/mnt/pbsync_restore"
 LOG_FILE_PATH = "/app/data/pbsync_stream.log"
 
 def run_host_command(command, env=None):
     """
-    Komutu Docker içinde değil, doğrudan HOST makinede çalıştırır (nsenter).
+    Komutu Docker içinde değil, doğrudan HOST (Ubuntu) üzerinde çalıştırır.
     """
-    # Komut listesini string'e çevir
     cmd_str = ' '.join(command) if isinstance(command, list) else command
     print(f"HOST_EXEC: {cmd_str}")
 
-    # Ortam değişkenlerini komutun başına ekle (Çünkü nsenter env aktarmaz)
     env_prefix = ""
     if env:
         for k, v in env.items():
             env_prefix += f"export {k}='{v}'; "
     
-    # nsenter ile host namespace'ine girip komutu çalıştır
-    # -t 1: Host PID 1 (init/systemd) namespace'ini hedefle
+    # nsenter ile host'un PID 1 namespace'ine girip komutu çalıştırıyoruz
     full_cmd = f"nsenter -t 1 -m -u -n -i bash -c \"{env_prefix}{cmd_str}\""
     
     try:
@@ -41,29 +38,8 @@ def run_host_command(command, env=None):
         print(f"STDERR: {e.stderr.strip()}")
         raise e
 
-def run_local_command(command, env=None):
-    """
-    Komutu Docker konteyneri içinde çalıştırır (Örn: Rclone, Tar).
-    """
-    cmd_str = ' '.join(command) if isinstance(command, list) else command
-    print(f"LOCAL_EXEC: {cmd_str}")
-    try:
-        current_env = os.environ.copy()
-        if env: current_env.update(env)
-        
-        result = subprocess.run(
-            command, shell=True if isinstance(command, str) else False, 
-            check=True, capture_output=True, text=True, env=current_env
-        )
-        return result
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR on LOCAL: {e.returncode}")
-        print(f"STDERR: {e.stderr.strip()}")
-        raise e
-
 def cleanup():
     print("--- Starting Cleanup (On Host) ---")
-    # Tüm temizlik işlemleri Host üzerinde yapılmalı
     try: run_host_command(f"umount -l {MOUNT_POINT}")
     except: pass
     try: run_host_command("vgchange -an")
@@ -72,28 +48,28 @@ def cleanup():
     except: pass
     try: run_host_command(f"proxmox-backup-client unmap {DRIVE_NAME}")
     except: pass
-    # Olası kilitli loop cihazlarını temizle
     try: run_host_command("losetup -D") 
     except: pass
     print("--- Cleanup Finished ---")
 
 def find_loop_on_host():
-    """
-    Host üzerindeki loop cihazlarını tarar.
-    """
+    """Host üzerindeki loop cihazını bulur."""
     try:
         res = run_host_command("losetup -a")
         output = res.stdout.strip()
         for line in output.splitlines():
             if DRIVE_NAME in line or "proxmox" in line:
                 return line.split(":")[0].strip()
+        
+        # Fallback: En son eklenen loop
+        res = run_host_command("ls -t /dev/loop* | head -n 1")
+        if res.stdout and "/dev/loop" in res.stdout:
+            return res.stdout.strip()
     except: pass
     return None
 
 def get_partitions_on_host(loop_dev):
-    """
-    Host üzerinde fdisk çalıştırarak partitionları bulur.
-    """
+    """Host üzerinde fdisk ile partitionları bulur (Yedek plan)."""
     print(f"-> Scanning partitions on Host: {loop_dev}...")
     partitions = []
     try:
@@ -114,13 +90,11 @@ def get_partitions_on_host(loop_dev):
                 offset = start_sector * sector_size
                 partitions.append(offset)
             except: continue
-    except Exception as e:
-        print(f"Fdisk error: {e}")
+    except: pass
     return partitions
 
 def try_mount_on_host(device):
     print(f"-> Host Mounting: {device}")
-    # Klasör yoksa host üzerinde oluştur
     run_host_command(f"mkdir -p {MOUNT_POINT}")
     
     cmds = [
@@ -140,9 +114,7 @@ def try_mount_on_host(device):
 
 def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
     print(f"\n--- Exploring Snapshot (HOST MODE) ---")
-    current_env = os.environ.copy()
     
-    # PBS Environment Variables for Host
     host_env = {
         'PBS_PASSWORD': config['pbs_password'],
         'PBS_REPOSITORY': config['pbs_repository_path']
@@ -156,6 +128,7 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
     try:
         # 1. MAP (Host Üzerinde)
         print("-> Mapping on Host...")
+        # Host üzerinde map yapıyoruz. Loop device otomatik atanacak.
         map_cmd = f"proxmox-backup-client map {snapshot} {DRIVE_NAME} --repository {config['pbs_repository_path']}"
         run_host_command(map_cmd, env=host_env)
         time.sleep(2)
@@ -163,18 +136,12 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
         # 2. Identify Loop
         active_loop = find_loop_on_host()
         if not active_loop:
-            # Fallback: En son oluşturulan loop
-            try:
-                res = run_host_command("ls -t /dev/loop* | head -n 1")
-                active_loop = res.stdout.strip()
-            except: pass
-        
-        if not active_loop:
             return {"status": "error", "message": "Map failed or loop device not found on host."}
         
         print(f"-> Active Loop: {active_loop}")
 
         # 3. Activate (Host)
+        # Partitionları ve LVM'leri host üzerinde aktifleştir
         try: run_host_command(f"kpartx -a -v -s {active_loop}")
         except: pass
         try: 
@@ -184,30 +151,29 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
         time.sleep(1)
 
         # 4. Find Candidates & Mount (Host)
-        # Mapper cihazlarını host üzerinde ara
         candidates = []
         try:
+            # Mapper cihazlarını bul (loop0p1, loop0p2, LVM volumeleri)
             res = run_host_command(f"ls /dev/mapper/loop*p*")
             candidates.extend(res.stdout.split())
         except: pass
         
         try:
-            res = run_host_command(f"ls /dev/mapper/*-root") # LVM genelde root diye biter
+            res = run_host_command(f"ls /dev/mapper/*-root") 
             candidates.extend(res.stdout.split())
         except: pass
 
-        # Fdisk Offset (Fallback)
+        # Eğer mapper yoksa fdisk offset ile manuel dene
         if not candidates:
             offsets = get_partitions_on_host(active_loop)
             for off in offsets:
-                # Offset loop oluştur
                 try:
+                    # Host üzerinde offset loop yarat
                     res = run_host_command(f"losetup -f --show --offset {off} {active_loop}")
                     candidates.append(res.stdout.strip())
                 except: pass
         
-        # Raw Device ekle
-        candidates.append(active_loop)
+        candidates.append(active_loop) # Raw device'ı da dene
 
         mounted = False
         for dev in reversed(candidates):
@@ -218,8 +184,8 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
         if not mounted:
             return {"status": "error", "message": "Could not mount filesystem on Host."}
 
-        # 5. List Files (Docker içinden okuyoruz, çünkü bind mount var)
-        # Docker /mnt/pbsync_restore klasörünü görebiliyor
+        # 5. List Files (Docker içinden)
+        # Host /mnt/pbsync_restore'a bağladı, biz de docker'da aynı yeri görüyoruz.
         safe_path = os.path.normpath(os.path.join(MOUNT_POINT, path.strip('/')))
         if not safe_path.startswith(MOUNT_POINT): safe_path = MOUNT_POINT
 
@@ -245,8 +211,6 @@ def list_files_in_snapshot(config: dict, snapshot: str, path: str = ""):
 
 def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: str = "", source_paths: str = ""):
     print(f"\n--- Starting Stream (HOST MODE) ---")
-    
-    # PBS Env vars for Host
     host_env = {
         'PBS_PASSWORD': config['pbs_password'],
         'PBS_REPOSITORY': config['pbs_repository_path']
@@ -263,11 +227,6 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         time.sleep(2)
 
         active_loop = find_loop_on_host()
-        if not active_loop:
-            # Basit fallback
-            res = run_host_command("losetup -a | tail -n 1") # Sonuncuyu al
-            if res.stdout: active_loop = res.stdout.split(":")[0]
-        
         if not active_loop: raise Exception("Loop device not found on host.")
         print(f"-> Active Loop: {active_loop}")
 
@@ -302,10 +261,8 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         
         if not mounted: raise Exception("Mount failed on Host.")
 
-        # 3. Stream (Docker - LOCAL)
-        # Dosyalar artık /mnt/pbsync_restore altında ve Docker bunu görüyor.
-        # Tar ve Rclone Docker içinde çalışmaya devam edebilir!
-        
+        # 3. Stream (Docker)
+        # Dosyalar hazır, upload işlemini başlat
         vmid = snapshot.split('/')[1]
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         archive_name = f"{vmid}_{timestamp}.tar.gz"
@@ -320,7 +277,6 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         if source_paths.strip():
             dirs = [p.strip() for p in source_paths.split(',') if p.strip()]
 
-        # Local execution (Docker Container)
         tar_cmd = ["tar", "cf", "-"] + dirs
         pigz_cmd = ["pigz", "-1"]
         rclone_cmd = ["rclone", "rcat", full_remote_path, "-P", "--buffer-size", "128M"]
