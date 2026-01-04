@@ -8,7 +8,7 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
     <style>
-        /* CSS BLOKLARI AYNEN KORUNACAK (Önceki attığım gibi) */
+        /* Önceki CSS aynen kalıyor */
         :root { --pbs-bg-body: #f5f5f5; --pbs-bg-panel: #ffffff; --pbs-bg-header: #333333; --pbs-text-main: #333333; --pbs-text-muted: #666666; --pbs-border: #cccccc; --pbs-input-bg: #ffffff; --pbs-input-text: #333333; --pbs-input-disabled: #e9ecef; --pbs-orange: #E57000; --pbs-blue: #3892d6; --pbs-green: #21ba45; --pbs-red: #ff4d4d; --pbs-header-text: #ffffff; --pbs-hint-bg: #e9ecef; --pbs-hint-text: #555; --pbs-modal-bg: #ffffff; --pbs-dropdown-bg: #ffffff; --pbs-dropdown-hover: #f0f0f0; }
         [data-theme="dark"] { --pbs-bg-body: #121212; --pbs-bg-panel: #212121; --pbs-bg-header: #282929; --pbs-text-main: #e0e0e0; --pbs-text-muted: #bbbbbb; --pbs-border: #383838; --pbs-input-bg: #121212; --pbs-input-text: #e0e0e0; --pbs-input-disabled: #2a2a2a; --pbs-hint-bg: #2a2a2a; --pbs-hint-text: #ddd; --pbs-modal-bg: #212121; --pbs-dropdown-bg: #2c2c2c; --pbs-dropdown-hover: #3a3a3a; }
         body { background-color: var(--pbs-bg-body); color: var(--pbs-text-main); font-family: 'Open Sans', sans-serif; font-size: 14px; margin: 0; height: 100vh; display: flex; flex-direction: column; transition: all 0.3s; }
@@ -155,9 +155,13 @@
                 <div class="modal-header"><h5 class="modal-title"><i class="bi bi-hdd-stack me-2"></i>Snapshot Explorer</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                 <div class="modal-body p-0">
                     <div class="d-flex align-items-center p-2 border-bottom" style="background-color: var(--pbs-input-disabled);">
-                        <button class="btn btn-sm btn-outline-secondary me-2" id="backToPartsBtn" onclick="openExplorer()" style="display:none;"><i class="bi bi-arrow-left"></i> Disks</button>
-                        <button class="btn btn-sm btn-link text-decoration-none" onclick="explorePath('')"><i class="bi bi-house-door-fill"></i> Root</button>
-                        <span class="mx-1 text-muted">/</span><span id="currentPathLabel" class="text-muted small">Loading...</span>
+                        <button class="btn btn-sm btn-outline-secondary me-2" id="backToPartsBtn" onclick="openExplorer()" style="display:none;"><i class="bi bi-hdd me-1"></i>Disks</button>
+                        <button class="btn btn-sm btn-outline-secondary me-2" id="upDirBtn" onclick="goUpDir()" style="display:none;"><i class="bi bi-arrow-90deg-up me-1"></i>Up</button>
+                        
+                        <div class="d-flex align-items-center ms-1 text-muted overflow-hidden">
+                            <i class="bi bi-folder2-open me-2"></i>
+                            <span id="currentPathLabel" class="small text-truncate">...</span>
+                        </div>
                     </div>
                     <div id="explorerList" class="list-group list-group-flush"></div>
                 </div>
@@ -189,10 +193,9 @@
         const snapshotSelect = document.getElementById("snapshotSelect");
         const logWindow = document.getElementById("logWindow");
         const globalError = document.getElementById("globalError");
-        const globalErrorText = document.getElementById("globalErrorText");
-        let allVMs = [];
         let currentPartitionId = null;
-        let logInterval = null; // Log polling timer
+        let currentPath = "";
+        let logInterval = null;
 
         document.addEventListener('DOMContentLoaded', () => { checkStatus(); scanVMs(); });
         vmInput.addEventListener('focus', () => { if (vmList.innerHTML.trim() !== "") vmList.style.display = 'block'; });
@@ -200,11 +203,9 @@
         vmInput.addEventListener('input', () => {
             const filter = vmInput.value.toUpperCase();
             const items = vmList.getElementsByClassName("dropdown-item");
-            let hasVisible = false;
             for (let i = 0; i < items.length; i++) {
                 const txt = items[i].textContent || items[i].innerText;
-                if (txt.toUpperCase().indexOf(filter) > -1) { items[i].style.display = "block"; hasVisible = true; } 
-                else { items[i].style.display = "none"; }
+                items[i].style.display = (txt.toUpperCase().indexOf(filter) > -1) ? "block" : "none";
             }
             vmList.style.display = 'block';
         });
@@ -262,9 +263,8 @@
                 const res = await fetch("/start-stream", {method: "POST", body: formData});
                 const data = await res.json();
                 if(data.status === 'started') {
-                    logWindow.innerHTML = ""; // Clear old logs
+                    logWindow.innerHTML = "";
                     log("Job started. Waiting for logs...");
-                    // START POLLING
                     if (logInterval) clearInterval(logInterval);
                     logInterval = setInterval(fetchLogs, 2000);
                 } else {
@@ -279,11 +279,10 @@
                 const res = await fetch("/stream-logs");
                 const data = await res.json();
                 if (data.logs) {
-                    // Replace content with file content (tail)
                     logWindow.innerText = data.logs;
                     logWindow.scrollTop = logWindow.scrollHeight;
                 }
-            } catch (e) { console.error("Log fetch error", e); }
+            } catch (e) {}
         }
 
         function log(msg) {
@@ -291,29 +290,44 @@
             logWindow.scrollTop = logWindow.scrollHeight;
         }
 
-        // Explorer functions (same as before)
+        // EXPLORER LOGIC
         let explorerModal;
         function openExplorer() {
             const snapshot = document.getElementById("snapshotSelect").value;
             if (!snapshot) return alert("Select snapshot first");
             currentPartitionId = null;
-            document.getElementById("backToPartsBtn").style.display = "none";
-            document.getElementById("currentPathLabel").innerText = "Scanning Disks...";
+            currentPath = "";
+            updateExplorerUI();
+            
             if (!explorerModal) explorerModal = new bootstrap.Modal(document.getElementById('explorerModal'));
             explorerModal.show();
             loadPartitions(snapshot);
         }
 
+        function updateExplorerUI() {
+            document.getElementById("backToPartsBtn").style.display = (currentPartitionId !== null) ? "inline-block" : "none";
+            document.getElementById("upDirBtn").style.display = (currentPath !== "") ? "inline-block" : "none";
+            document.getElementById("currentPathLabel").innerText = currentPath ? currentPath : (currentPartitionId !== null ? "Root" : "Select Disk");
+        }
+
+        function goUpDir() {
+            if (!currentPath) return;
+            // Bir üst dizine çık
+            const parts = currentPath.split('/');
+            parts.pop(); 
+            explorePath(parts.join('/'));
+        }
+
         async function loadPartitions(snapshot) {
-            const listContainer = document.getElementById("explorerList");
-            listContainer.innerHTML = '<div class="text-center p-4"><div class="spinner-border text-primary"></div><p>Scanning partitions...</p></div>';
+            const list = document.getElementById("explorerList");
+            list.innerHTML = '<div class="text-center p-4"><div class="spinner-border text-primary"></div><p>Scanning partitions...</p></div>';
             let formData = new FormData(); formData.append("snapshot", snapshot);
             try {
                 const res = await fetch("/explore", {method: "POST", body: formData});
                 const data = await res.json();
                 if (data.status === "success" && data.type === "partitions") renderPartitions(data.items);
-                else listContainer.innerHTML = `<div class="p-3 text-danger text-center">${data.message}</div>`;
-            } catch (e) { listContainer.innerHTML = "Error"; }
+                else list.innerHTML = `<div class="p-3 text-danger text-center">${data.message}</div>`;
+            } catch (e) { list.innerHTML = "Error"; }
         }
 
         function renderPartitions(items) {
@@ -330,20 +344,25 @@
 
         function selectPartition(id) {
             currentPartitionId = id;
-            document.getElementById("backToPartsBtn").style.display = "inline-block";
+            currentPath = ""; // Root'a dön
+            updateExplorerUI();
             explorePath("");
         }
 
         async function explorePath(path) {
             if (currentPartitionId === null) return;
+            currentPath = path;
+            updateExplorerUI();
+
             const snapshot = document.getElementById("snapshotSelect").value;
             const list = document.getElementById("explorerList");
-            document.getElementById("currentPathLabel").innerText = path || "/";
-            list.innerHTML = '<div class="text-center p-4"><div class="spinner-border spinner-border-sm text-primary"></div><p>Loading...</p></div>';
+            list.innerHTML = '<div class="text-center p-4"><div class="spinner-border spinner-border-sm text-primary mb-2"></div><p>Listing...</p></div>';
+            
             let formData = new FormData();
             formData.append("snapshot", snapshot);
             formData.append("path", path);
             formData.append("partition_id", currentPartitionId);
+            
             try {
                 const res = await fetch("/explore", {method: "POST", body: formData});
                 const data = await res.json();
@@ -360,24 +379,27 @@
                 const icon = isDir ? 'bi-folder-fill text-warning' : 'bi-file-earmark-text text-secondary';
                 const div = document.createElement("div");
                 div.className = "list-group-item d-flex justify-content-between align-items-center";
-                div.innerHTML = `<span><i class="bi ${icon} me-2"></i>${item.name}</span>`;
-                if(isDir) div.style.cursor = "pointer";
-                if(isDir) div.onclick = () => explorePath(item.path);
-                if(!isDir) {
-                    // Add button for files/dirs
-                    const btn = document.createElement("button");
-                    btn.className = "btn btn-sm btn-outline-primary py-0 px-2";
-                    btn.innerHTML = '<i class="bi bi-plus-lg"></i>';
-                    btn.onclick = (e) => { e.stopPropagation(); addPathToInput(item.path); };
-                    div.appendChild(btn);
-                } else {
-                     // Add button for dirs too (to add folder)
-                    const btn = document.createElement("button");
-                    btn.className = "btn btn-sm btn-outline-primary py-0 px-2 ms-auto";
-                    btn.innerHTML = '<i class="bi bi-plus-lg"></i>';
-                    btn.onclick = (e) => { e.stopPropagation(); addPathToInput(item.path); };
-                    div.appendChild(btn);
+                
+                // Tıklanınca içine gir (Sadece klasörler için)
+                let nameHtml = `<span class="${isDir ? 'text-decoration-underline' : ''}" style="cursor:${isDir ? 'pointer' : 'default'}"><i class="bi ${icon} me-2"></i>${item.name}</span>`;
+                div.innerHTML = nameHtml;
+                
+                if(isDir) {
+                    div.onclick = (e) => { 
+                        // Butona tıklanmadıysa içine gir
+                        if(e.target.tagName !== 'BUTTON' && e.target.parentNode.tagName !== 'BUTTON') {
+                            explorePath(item.path);
+                        }
+                    };
                 }
+
+                // Add Button (Her zaman sağda)
+                const btn = document.createElement("button");
+                btn.className = "btn btn-sm btn-outline-primary py-0 px-2 ms-auto";
+                btn.innerHTML = '<i class="bi bi-plus-lg"></i>';
+                btn.onclick = (e) => { e.stopPropagation(); addPathToInput(item.path); };
+                div.appendChild(btn);
+                
                 list.appendChild(div);
             });
         }
@@ -394,6 +416,10 @@
                 const status = await res.json();
                 updateBadge('pbsStatus', status.pbs);
                 updateBadge('rcloneStatus', status.rclone);
+                if (!status.pbs.status || !status.rclone.status) {
+                    document.getElementById('globalError').style.display = 'block';
+                    document.getElementById('globalErrorText').innerText = "Check Config";
+                }
             } catch(e) {}
         }
         function updateBadge(id, s) { document.getElementById(id).className = 'status-badge ' + (s.status ? 'status-online' : 'status-offline'); }

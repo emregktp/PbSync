@@ -21,7 +21,7 @@ def append_log(msg):
 
 def run_host_command(command, env=None):
     cmd_str = ' '.join(command) if isinstance(command, list) else command
-    # append_log(f"HOST_EXEC: {cmd_str}") # Çok kirletmesin diye kapalı
+    # append_log(f"HOST_EXEC: {cmd_str}") 
     print(f"HOST_EXEC: {cmd_str}")
 
     env_prefix = ""
@@ -59,6 +59,7 @@ def find_loop_on_host():
         for line in res.stdout.strip().splitlines():
             if DRIVE_NAME in line or "proxmox" in line:
                 return line.split(":")[0].strip()
+        # Fallback
         res = run_host_command("ls -t /dev/loop* | head -n 1")
         if res.stdout and "/dev/loop" in res.stdout:
             return res.stdout.strip()
@@ -186,7 +187,6 @@ def list_files_or_partitions(config: dict, snapshot: str, partition_id: str = No
     finally: cleanup()
 
 def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: str = "", source_paths: str = ""):
-    # Log dosyasını sıfırla
     with open(LOG_FILE_PATH, 'w') as f: f.write(f"--- Starting Stream for {snapshot} ---\n")
     
     append_log(f"Snapshot: {snapshot}")
@@ -207,7 +207,6 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         if not active_loop: raise Exception("Loop device not found on host.")
         append_log(f"-> Active Loop: {active_loop}")
 
-        # Otomatik en mantıklı bölümü bul ve bağla (Smart Mount Logic)
         append_log("-> Scanning for partitions...")
         candidates = get_candidates(active_loop)
         
@@ -221,49 +220,47 @@ def run_backup_process(config: dict, snapshot: str, remote: str, target_folder: 
         
         if not mounted: raise Exception("Mount failed on Host.")
 
-        # Stream
+        # -- Rclone Path Fix --
         vmid = snapshot.split('/')[1]
         timestamp = time.strftime('%Y%m%d-%H%M%S')
         archive_name = f"{vmid}_{timestamp}.tar.gz"
         
-        full_remote_path = f"{remote}:{archive_name}"
+        # Remote ismindeki fazladan ':' işaretini temizle
+        clean_remote = remote.rstrip(":")
+        
+        # Tam yol oluştur: remote:folder/file
         if target_folder.strip():
-            full_remote_path = f"{remote}:{target_folder.strip().strip('/')}/{archive_name}"
+            full_remote_path = f"{clean_remote}:{target_folder.strip().strip('/')}/{archive_name}"
+        else:
+            full_remote_path = f"{clean_remote}:{archive_name}"
 
         os.chdir(MOUNT_POINT)
+        
         dirs = ["."]
         if source_paths.strip():
             dirs = [p.strip() for p in source_paths.split(',') if p.strip()]
 
         tar_cmd = ["tar", "cf", "-"] + dirs
         pigz_cmd = ["pigz", "-1"]
-        # -P progress verir, stderr'e basar
-        rclone_cmd = ["rclone", "rcat", full_remote_path, "-P", "--stats", "1s", "--buffer-size", "128M"]
+        rclone_cmd = ["rclone", "rcat", full_remote_path, "-P", "--stats", "2s", "--buffer-size", "128M"]
 
         append_log(f"-> Streaming to {full_remote_path}...")
         
         current_env = os.environ.copy()
-        # Process zinciri
         p1 = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=current_env)
         p2 = subprocess.Popen(pigz_cmd, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=current_env)
         p1.stdout.close()
         
-        # Rclone'un stderr çıktısını (progress) okuyacağız
         p3 = subprocess.Popen(rclone_cmd, stdin=p2.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=current_env)
         p2.stdout.close()
         
-        # Anlık okuma döngüsü
         while True:
             line = p3.stderr.readline()
             if not line and p3.poll() is not None:
                 break
             if line:
-                # Logu dosyaya yaz ama konsolu boğma
                 clean_line = line.strip()
                 if "Transferred" in clean_line or "%" in clean_line:
-                     # Sadece progress satırlarını yaz
-                     # Dosyaya her satırı yazmak yerine üzerine yazabiliriz veya append ederiz
-                     # Şimdilik append edelim, arayüz son satırları okur.
                      append_log(f"[Cloud] {clean_line}")
         
         p3.wait()
