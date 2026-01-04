@@ -69,7 +69,7 @@
             position: absolute;
             top: 100%;
             left: 0;
-            width: 100%; /* Parent genişliğine tam otursun */
+            width: 100%;
             background-color: var(--pbs-dropdown-bg);
             border: 1px solid var(--pbs-border);
             border-top: none;
@@ -83,7 +83,7 @@
             padding: 8px 12px;
             cursor: pointer;
             color: var(--pbs-text-main);
-            display: block; /* Alt alta dizilmesi için */
+            display: block;
             width: 100%;
             box-sizing: border-box;
         }
@@ -412,6 +412,10 @@
                 </div>
                 <div class="modal-body p-0">
                     <div class="d-flex align-items-center p-2 border-bottom" style="background-color: var(--pbs-input-disabled);">
+                        <button class="btn btn-sm btn-outline-secondary me-2" id="backToPartsBtn" onclick="openExplorer()" style="display:none;">
+                            <i class="bi bi-arrow-left"></i> Disks
+                        </button>
+                        
                         <button class="btn btn-sm btn-link text-decoration-none" onclick="explorePath('')">
                             <i class="bi bi-house-door-fill"></i> Root
                         </button>
@@ -460,12 +464,14 @@
         const globalErrorText = document.getElementById("globalErrorText");
 
         let allVMs = [];
+        let currentPartitionId = null; // YENİ: Seçilen Partition ID
 
         document.addEventListener('DOMContentLoaded', () => {
             checkStatus();
             scanVMs();
         });
 
+        // --- CUSTOM DROPDOWN LOGIC ---
         vmInput.addEventListener('focus', () => {
             if (vmList.innerHTML.trim() !== "") vmList.style.display = 'block';
         });
@@ -584,6 +590,7 @@
             setTimeout(() => document.getElementById("startBackupBtn").disabled = false, 3000);
         }
 
+        // --- EXPLORER LOGIC (GÜNCELLENDİ) ---
         let explorerModal;
         
         function openExplorer() {
@@ -593,33 +600,96 @@
                 return;
             }
             
+            // Sıfırla
+            currentPartitionId = null; 
+            document.getElementById("backToPartsBtn").style.display = "none";
+            document.getElementById("currentPathLabel").innerText = "Scanning Disks...";
+            
             if (!explorerModal) explorerModal = new bootstrap.Modal(document.getElementById('explorerModal'));
             explorerModal.show();
-            explorePath("");
+            
+            loadPartitions(snapshot); // Önce diskleri yükle
         }
 
-        async function explorePath(path) {
-            const snapshot = document.getElementById("snapshotSelect").value;
+        // 1. PARTITION LİSTELEME
+        async function loadPartitions(snapshot) {
             const listContainer = document.getElementById("explorerList");
-            const pathLabel = document.getElementById("currentPathLabel");
-            
-            pathLabel.innerText = path || "/";
-            listContainer.innerHTML = `
-                <div class="text-center p-4 text-muted">
-                    <div class="spinner-border spinner-border-sm text-primary mb-2" role="status"></div>
-                    <p class="mb-0 small">Reading filesystem...</p>
-                </div>`;
+            listContainer.innerHTML = '<div class="text-center p-4"><div class="spinner-border text-primary"></div><p>Scanning partitions...</p></div>';
 
             let formData = new FormData();
             formData.append("snapshot", snapshot);
-            formData.append("path", path);
+            // partition_id göndermiyoruz, sunucu diskleri listeleyecek
 
             try {
                 const res = await fetch("/explore", {method: "POST", body: formData});
                 const data = await res.json();
 
-                if (data.status === "success") {
-                    renderExplorer(data.items);
+                if (data.status === "success" && data.type === "partitions") {
+                    renderPartitions(data.items);
+                } else {
+                    listContainer.innerHTML = `<div class="p-3 text-danger text-center">${data.message}</div>`;
+                }
+            } catch (e) {
+                listContainer.innerHTML = `<div class="p-3 text-danger text-center">Network Error</div>`;
+            }
+        }
+
+        function renderPartitions(items) {
+            const listContainer = document.getElementById("explorerList");
+            listContainer.innerHTML = "";
+            
+            if (items.length === 0) {
+                listContainer.innerHTML = '<div class="p-3 text-center">No partitions found.</div>';
+                return;
+            }
+
+            items.forEach(p => {
+                const itemDiv = document.createElement("div");
+                itemDiv.className = "list-group-item list-group-item-action d-flex justify-content-between align-items-center";
+                itemDiv.style.cursor = "pointer";
+                itemDiv.onclick = () => selectPartition(p.id);
+                
+                itemDiv.innerHTML = `
+                    <div>
+                        <i class="bi bi-device-hdd text-primary me-2"></i> 
+                        <strong>${p.name}</strong> 
+                        <span class="text-muted small ms-2">(${p.size})</span>
+                        <div class="small text-muted ms-4">${p.desc}</div>
+                    </div>
+                    <i class="bi bi-chevron-right text-muted"></i>
+                `;
+                listContainer.appendChild(itemDiv);
+            });
+        }
+
+        function selectPartition(id) {
+            currentPartitionId = id;
+            document.getElementById("backToPartsBtn").style.display = "inline-block";
+            explorePath(""); // Şimdi o partition'ı tara
+        }
+
+        // 2. DOSYA LİSTELEME
+        async function explorePath(path) {
+            if (currentPartitionId === null) return;
+
+            const snapshot = document.getElementById("snapshotSelect").value;
+            const listContainer = document.getElementById("explorerList");
+            const pathLabel = document.getElementById("currentPathLabel");
+            
+            pathLabel.innerText = path || "/";
+            listContainer.innerHTML = '<div class="text-center p-4"><div class="spinner-border spinner-border-sm text-primary mb-2"></div><p class="mb-0 small">Mounting & Listing...</p></div>';
+
+            let formData = new FormData();
+            formData.append("snapshot", snapshot);
+            formData.append("path", path);
+            formData.append("partition_id", currentPartitionId); // Seçili partition'ı gönder
+
+            try {
+                const res = await fetch("/explore", {method: "POST", body: formData});
+                const data = await res.json();
+
+                if (data.status === "success" && data.type === "files") {
+                    renderFiles(data.items);
                 } else {
                     listContainer.innerHTML = `<div class="p-3 text-danger text-center"><i class="bi bi-exclamation-circle me-1"></i> ${data.message}</div>`;
                 }
@@ -628,7 +698,7 @@
             }
         }
 
-        function renderExplorer(items) {
+        function renderFiles(items) {
             const listContainer = document.getElementById("explorerList");
             listContainer.innerHTML = "";
 
@@ -704,6 +774,17 @@
         function showGlobalError(msg) {
             globalError.style.display = 'block';
             globalErrorText.innerText = msg;
+        }
+
+        function log(msg, type = 'info') {
+            logWindow.style.display = 'block';
+            const line = document.createElement('div');
+            line.className = 'log-line';
+            const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+            let colorClass = type === 'error' ? 'log-error' : (type === 'success' ? 'log-success' : 'log-info');
+            line.innerHTML = `<span class="text-muted small">[${time}]</span> <span class="${colorClass}">${msg}</span>`;
+            logWindow.appendChild(line);
+            logWindow.scrollTop = logWindow.scrollHeight;
         }
     </script>
 </body>
