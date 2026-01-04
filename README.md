@@ -74,7 +74,7 @@ Bu içeriği oluşturmak için **kendi bilgisayarınızda (Windows/Mac/Linux)** 
 2.  Terminali açın ve `rclone config` yazın.
 3.  `n` tuşuna basarak **New Remote** oluşturun.
 4.  İsim olarak `gdrive` verin.
-5.  Storage türü listesinden **Google Drive**'ı bulun (genelde 18 numara) ve numarasını yazın.
+5.  Storage türü listesinden **Google Drive**'ı bulun (genelde 22 numara) ve numarasını yazın.
 6.  `client_id` ve `client_secret` kısımlarını boş geçin (Enter).
 7.  `scope` olarak **1 (Full access)** seçin.
 8.  `root_folder_id` ve `service_account_file` kısımlarını boş geçin (Enter).
